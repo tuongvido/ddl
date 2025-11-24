@@ -1,0 +1,181 @@
+version: "3.8"
+
+services:
+  # Zookeeper - Required for Kafka
+  zookeeper:
+    image: confluentinc/cp-zookeeper:latest
+    hostname: zookeeper
+    container_name: zookeeper
+    ports:
+      - "2181:2181"
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    networks:
+      - livestream-network
+
+  # Kafka - Message Queue
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    hostname: kafka
+    container_name: kafka
+    depends_on:
+      - zookeeper
+    ports:
+      - "9092:9092"
+      - "29092:29092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: "zookeeper:2181"
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:29092,PLAINTEXT_HOST://0.0.0.0:9092
+    networks:
+      - livestream-network
+
+  # PostgreSQL - Airflow metadata database
+  postgres:
+    image: postgres:13
+    container_name: postgres
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-db-volume:/var/lib/postgresql/data
+    networks:
+      - livestream-network
+
+  # Redis - Airflow message broker
+  redis:
+    image: redis:latest
+    container_name: redis
+    ports:
+      - "6379:6379"
+    networks:
+      - livestream-network
+
+  # Airflow Webserver
+  airflow-webserver:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.airflow
+    image: custom-airflow:2.7.1
+    container_name: airflow-webserver
+    depends_on:
+      - postgres
+      - redis
+    environment:
+      AIRFLOW__CORE__EXECUTOR: CeleryExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+      AIRFLOW__CELERY__RESULT_BACKEND: db+postgresql://airflow:airflow@postgres/airflow
+      AIRFLOW__CELERY__BROKER_URL: redis://redis:6379/0
+      AIRFLOW__CORE__FERNET_KEY: ""
+      AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW__API__AUTH_BACKENDS: "airflow.api.auth.backend.basic_auth"
+      _AIRFLOW_DB_UPGRADE: "true"
+      _AIRFLOW_WWW_USER_CREATE: "true"
+      _AIRFLOW_WWW_USER_USERNAME: admin
+      _AIRFLOW_WWW_USER_PASSWORD: admin
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      MONGO_HOST: mongodb
+      MONGO_PORT: 27017
+    volumes:
+      - ../dags:/opt/airflow/dags
+      - ../logs:/opt/airflow/logs
+      - ../plugins:/opt/airflow/plugins
+      - ../src:/opt/airflow/src
+      - ../data:/opt/airflow/data
+      - ../models:/opt/airflow/models
+    ports:
+      - "8080:8080"
+    command: webserver
+    networks:
+      - livestream-network
+
+  # Airflow Scheduler
+  airflow-scheduler:
+    image: custom-airflow:2.7.1
+    container_name: airflow-scheduler
+    depends_on:
+      - postgres
+      - redis
+      - airflow-webserver
+    environment:
+      AIRFLOW__CORE__EXECUTOR: CeleryExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+      AIRFLOW__CELERY__RESULT_BACKEND: db+postgresql://airflow:airflow@postgres/airflow
+      AIRFLOW__CELERY__BROKER_URL: redis://redis:6379/0
+      AIRFLOW__CORE__FERNET_KEY: ""
+      AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      MONGO_HOST: mongodb
+      MONGO_PORT: 27017
+    volumes:
+      - ../dags:/opt/airflow/dags
+      - ../logs:/opt/airflow/logs
+      - ../plugins:/opt/airflow/plugins
+      - ../src:/opt/airflow/src
+      - ../data:/opt/airflow/data
+      - ../models:/opt/airflow/models
+    command: scheduler
+    networks:
+      - livestream-network
+
+  # Airflow Worker
+  airflow-worker:
+    image: custom-airflow:2.7.1
+    container_name: airflow-worker
+    depends_on:
+      - postgres
+      - redis
+    environment:
+      AIRFLOW__CORE__EXECUTOR: CeleryExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+      AIRFLOW__CELERY__RESULT_BACKEND: db+postgresql://airflow:airflow@postgres/airflow
+      AIRFLOW__CELERY__BROKER_URL: redis://redis:6379/0
+      AIRFLOW__CORE__FERNET_KEY: ""
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      MONGO_HOST: mongodb
+      MONGO_PORT: 27017
+    volumes:
+      - ../dags:/opt/airflow/dags
+      - ../logs:/opt/airflow/logs
+      - ../plugins:/opt/airflow/plugins
+      - ../src:/opt/airflow/src
+      - ../data:/opt/airflow/data
+      - ../models:/opt/airflow/models
+    command: celery worker
+    networks:
+      - livestream-network
+
+  # MongoDB - Store detection results
+  mongodb:
+    image: mongo:latest
+    container_name: mongodb
+    ports:
+      - "27017:27017"
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: admin
+      MONGO_INITDB_ROOT_PASSWORD: admin123
+    volumes:
+      - mongodb-data:/data/db
+    networks:
+      - livestream-network
+
+networks:
+  livestream-network:
+    driver: bridge
+
+volumes:
+  postgres-db-volume:
+  mongodb-data:
