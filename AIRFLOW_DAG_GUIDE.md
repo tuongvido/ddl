@@ -27,7 +27,7 @@ Script này sẽ:
 DAG sẽ:
 
 - ✅ Check dependencies (opencv, kafka-python, ultralytics, etc.)
-- ✅ Start Producer (streaming video V_10.mp4 loop)
+- ✅ Start Producer (streaming video v001_converted.avi loop)
 - ✅ Start Video Consumer (YOLOv8 detection)
 - ✅ Start Audio Consumer (Whisper transcription)
 - ✅ Verify pipeline (check MongoDB có data)
@@ -46,7 +46,7 @@ DAG sẽ:
 1. **Processes chạy trong Docker**: Producer và Consumers chạy trong Airflow worker container, không phải trên host
 2. **Chạy background**: Các processes sẽ tiếp tục chạy sau khi DAG hoàn thành
 3. **Stop**: Để stop, cần restart Airflow containers hoặc kill processes trong container
-4. **Video path**: Đã hard-code `/opt/airflow/data/V_10.mp4` (mount từ host)
+4. **Video path**: Đã hard-code `/opt/airflow/data/v001_converted.avi` (mount từ host)
 
 ## Troubleshooting
 

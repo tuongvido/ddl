@@ -10,14 +10,17 @@ from kafka import KafkaConsumer
 from kafka.errors import KafkaError
 import json
 from typing import Dict, List, Any
+import cv2
 
 from config import (
     KAFKA_BOOTSTRAP_SERVERS,
     KAFKA_TOPIC_VIDEO,
-    YOLO_MODEL_PATH,
-    YOLO_CONFIDENCE_THRESHOLD,
-    YOLO_IOU_THRESHOLD,
-    HARMFUL_CLASSES,
+    VIOLENCE_CLASSIFIER_DIR,
+    USE_VIOLENCE_CLASSIFIER,
+    VIOLENCE_CLASSIFIER_THRESHOLD,
+    VIOLENCE_CLASSIFIER_FRAME_SKIP,
+    VIOLENCE_CLASSIFIER_BATCH_SIZE,
+    USE_ALL_DETECTIONS_AS_HARMFUL,
     LOG_LEVEL,
 )
 from utils import (
@@ -32,14 +35,17 @@ from utils import (
 logging.basicConfig(level=LOG_LEVEL)
 logger = logging.getLogger(__name__)
 
-# Try to import YOLOv8
+# Try to import classifier dependencies
 try:
-    from ultralytics import YOLO
+    from transformers import AutoFeatureExtractor, AutoModelForImageClassification
+    import torch
 
-    YOLO_AVAILABLE = True
-except ImportError:
-    logger.warning("YOLOv8 not available. Install with: pip install ultralytics")
-    YOLO_AVAILABLE = False
+    CLASSIFIER_AVAILABLE = True
+except Exception:
+    logger.warning(
+        "Transformers/torch not available. Install with: pip install transformers torch safetensors"
+    )
+    CLASSIFIER_AVAILABLE = False
 
 
 class VideoConsumer:
@@ -61,31 +67,114 @@ class VideoConsumer:
 
         logger.info("Initializing VideoConsumer")
 
-        # Load YOLO model
+        # Load ViT classifier model (if enabled)
         self.load_model()
 
     def load_model(self):
-        """Load YOLOv8 model"""
-        if not YOLO_AVAILABLE:
-            logger.error("YOLOv8 not available, cannot load model")
+        """Load ViT/frame-level violence classifier"""
+        self.classifier = None
+        self.feature_extractor = None
+        self.id2label = {}
+
+        if not USE_VIOLENCE_CLASSIFIER:
+            logger.info("Violence classifier disabled by configuration")
+            return
+
+        if not CLASSIFIER_AVAILABLE:
+            logger.error("Transformers/torch not available; cannot load classifier")
             return
 
         try:
-            model_path = Path(YOLO_MODEL_PATH)
+            model_dir = Path(VIOLENCE_CLASSIFIER_DIR)
 
-            if model_path.exists():
-                logger.info(f"Loading custom model from {YOLO_MODEL_PATH}")
-                self.model = YOLO(YOLO_MODEL_PATH)
+            # Support either a direct model directory or the huggingface_hub snapshot cache layout
+            chosen_dir = None
+            if model_dir.exists():
+                # direct layout
+                if (model_dir / "config.json").exists() or (
+                    model_dir / "preprocessor_config.json"
+                ).exists():
+                    chosen_dir = model_dir
+                else:
+                    # look for nested cache folder like models--<owner>--<repo>/snapshots/<id>/
+                    nested = list(model_dir.glob("models-*"))
+                    for n in nested:
+                        snaps = list(n.glob("snapshots/*"))
+                        for s in snaps:
+                            if (s / "config.json").exists() or (
+                                s / "preprocessor_config.json"
+                            ).exists():
+                                chosen_dir = s
+                                break
+                        if chosen_dir:
+                            break
+                    # fallback: search deeper
+                    if chosen_dir is None:
+                        snaps = list(model_dir.rglob("snapshots/*"))
+                        for s in snaps:
+                            if (s / "config.json").exists() or (
+                                s / "preprocessor_config.json"
+                            ).exists():
+                                chosen_dir = s
+                                break
+
+            if chosen_dir is None:
+                logger.warning(
+                    f"Violence classifier directory not found or missing config: {model_dir}"
+                )
+                logger.warning(
+                    "Place the Hugging Face model files in this folder (model.safetensors, config.json, preprocessor_config.json) or run snapshot_download to fetch the repo"
+                )
+                return
+
+            model_dir = chosen_dir
+
+            logger.info(f"Loading violence classifier from {model_dir}")
+            # Some repos use preprocessor_config.json / AutoImageProcessor instead of feature extractor
+            try:
+                self.feature_extractor = AutoFeatureExtractor.from_pretrained(
+                    str(model_dir)
+                )
+            except Exception:
+                from transformers import AutoImageProcessor
+
+                self.feature_extractor = AutoImageProcessor.from_pretrained(
+                    str(model_dir)
+                )
+
+            self.classifier = AutoModelForImageClassification.from_pretrained(
+                str(model_dir), local_files_only=True
+            )
+
+            # Move model to GPU if available
+            import torch
+
+            self.device = "cuda" if torch.cuda.is_available() else "cpu"
+            self.classifier.to(self.device)
+
+            # Setup id2label mapping
+            if (
+                hasattr(self.classifier.config, "id2label")
+                and self.classifier.config.id2label
+            ):
+                # Some checkpoints store generic labels like 'LABEL_0', 'LABEL_1'.
+                # Normalize to meaningful labels when possible.
+                raw = self.classifier.config.id2label
+                vals = set([str(v).upper() for v in raw.values()])
+                if any(v.startswith("LABEL_") for v in vals):
+                    # Assume convention: 0 = non-violence, 1 = violence
+                    self.id2label = {0: "non-violence", 1: "violence"}
+                else:
+                    self.id2label = raw
             else:
-                logger.warning(f"Custom model not found at {YOLO_MODEL_PATH}")
-                logger.info("Loading pre-trained YOLOv8 model (yolov8n.pt)")
-                self.model = YOLO("yolov8n.pt")  # Use nano model as default
+                # default mapping assumption
+                self.id2label = {0: "non-violence", 1: "violence"}
 
-            logger.info("YOLO model loaded successfully")
+            logger.info("Violence classifier loaded successfully")
 
         except Exception as e:
-            logger.error(f"Failed to load YOLO model: {e}")
-            raise
+            logger.error(f"Failed to load violence classifier: {e}")
+            self.classifier = None
 
     def connect_kafka(self):
         """Connect to Kafka broker"""
@@ -108,53 +197,96 @@ class VideoConsumer:
 
     def detect_objects(self, frame) -> List[Dict[str, Any]]:
         """
-        Detect objects in frame using YOLO
+        Run frame-level violence classification and return detections list.
 
         Args:
-            frame: OpenCV frame
+            frame: OpenCV BGR frame (numpy array)
 
         Returns:
-            List of detections
+            List of detections in the form [{"class": str, "confidence": float, "class_id": int}]
         """
-        if not self.model or not YOLO_AVAILABLE:
+        # If classifier not in use or not loaded, return empty
+        if (
+            not USE_VIOLENCE_CLASSIFIER
+            or not self.classifier
+            or not self.feature_extractor
+        ):
             return []
 
         try:
-            # Run inference
-            results = self.model(
-                frame,
-                conf=YOLO_CONFIDENCE_THRESHOLD,
-                iou=YOLO_IOU_THRESHOLD,
-                verbose=False,
-            )
+            # Frame skip logic
+            if self.frame_count % VIOLENCE_CLASSIFIER_FRAME_SKIP != 0:
+                return []
+
+            # Convert BGR (OpenCV) to RGB
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+            # Prepare inputs
+            inputs = self.feature_extractor(images=rgb, return_tensors="pt")
+
+            # Move tensors to device
+            import torch
+
+            inputs = {k: v.to(self.device) for k, v in inputs.items()}
+
+            with torch.no_grad():
+                outputs = self.classifier(**inputs)
+                probs = (
+                    torch.nn.functional.softmax(outputs.logits, dim=-1).cpu().numpy()[0]
+                )
+
+            # Build top-k label details
+            top_k = min(3, len(probs))
+            top_indices = probs.argsort()[::-1][:top_k]
+            label_details = []
+            for idx in top_indices:
+                lbl = self.id2label.get(int(idx), str(idx))
+                prob = float(probs[int(idx)])
+                label_details.append({"label": str(lbl), "prob": prob, "id": int(idx)})
+
+            # Determine if any top label indicates violence.
+            # Prefer checking class_id (1 == violence) when available to avoid substring issues
+            is_violation = False
+            violence_best = None
+            # First, look for positive-class id (commonly 1) with sufficient probability
+            for item in label_details:
+                if (
+                    int(item.get("id", -1)) == 1
+                    and item["prob"] >= VIOLENCE_CLASSIFIER_THRESHOLD
+                ):
+                    is_violation = True
+                    violence_best = item
+                    break
+
+            # Fallback: check explicit label equality (avoid substring matches like 'non-violence')
+            if not is_violation:
+                for item in label_details:
+                    lbl = item["label"].lower().strip()
+                    # treat exact 'violence' or 'violent' as positive
+                    if (
+                        lbl in ("violence", "violent")
+                        and item["prob"] >= VIOLENCE_CLASSIFIER_THRESHOLD
+                    ):
+                        is_violation = True
+                        violence_best = item
+                        break
 
             detections = []
-
-            for result in results:
-                boxes = result.boxes
-
-                for box in boxes:
-                    # Get box coordinates
-                    x1, y1, x2, y2 = box.xyxy[0].tolist()
-
-                    # Get confidence and class
-                    confidence = float(box.conf[0])
-                    class_id = int(box.cls[0])
-                    class_name = result.names[class_id]
-
-                    detection = {
-                        "bbox": [x1, y1, x2, y2],
-                        "confidence": confidence,
-                        "class": class_name,
-                        "class_id": class_id,
+            if is_violation:
+                detections.append(
+                    {
+                        "bbox": None,
+                        "confidence": violence_best["prob"],
+                        "class": violence_best["label"],
+                        "class_id": violence_best["id"],
+                        "label_details": label_details,
                     }
-
-                    detections.append(detection)
+                )
 
             return detections
 
         except Exception as e:
-            logger.error(f"Detection error: {e}")
+            logger.error(f"Classifier detection error: {e}")
             return []
 
     def check_harmful_content(self, detections: List[Dict]) -> Dict[str, Any]:
@@ -169,14 +301,26 @@ class VideoConsumer:
         """
         harmful_detections = []
 
-        for det in detections:
-            class_name = det["class"].lower()
-
-            # Check if object class is in harmful list
-            for harmful_class in HARMFUL_CLASSES:
-                if harmful_class.lower() in class_name:
-                    harmful_detections.append(det)
-                    break
+        # Demo mode: treat ALL detections as harmful for testing
+        if USE_ALL_DETECTIONS_AS_HARMFUL:
+            harmful_detections = detections
+        else:
+            # If using the ViT classifier, any returned 'violence' detection is harmful
+            if USE_VIOLENCE_CLASSIFIER:
+                for det in detections:
+                    # classifier returns class like 'violence' when positive
+                    class_name = str(det.get("class", "")).lower()
+                    if "violence" in class_name:
+                        harmful_detections.append(det)
+            else:
+                # Fallback: if detections include objects matching HARMFUL_CLASSES
+                for det in detections:
+                    class_name = det.get("class", "").lower()
+                    # Check if object class is in harmful list
+                    for harmful_class in []:
+                        if harmful_class.lower() in class_name:
+                            harmful_detections.append(det)
+                            break
 
         is_harmful = len(harmful_detections) > 0
 
@@ -276,7 +420,7 @@ class VideoConsumer:
                     "detection_type": detection_type,
                     "confidence": confidence,
                     "level": alert_level,
-                    "bbox": det["bbox"],
+                    "bbox": det.get("bbox"),
                     "details": f"Detected {detection_type} with confidence {confidence:.2%}",
                 }
 

@@ -28,24 +28,40 @@ AUDIO_CHUNK_DURATION = 3  # seconds
 AUDIO_FORMAT = "wav"
 
 # Model Configuration
-YOLO_MODEL_PATH = str(MODELS_DIR / "yolo_best.pt")
+# Priority: violence_detection.pt > yolo_best.pt (fallback to yolov8n.pt)
+YOLO_VIOLENCE_MODEL_PATH = str(
+    MODELS_DIR / "violence_detection.pt"
+)  # Violence-specific model
+YOLO_MODEL_PATH = str(MODELS_DIR / "yolo_best.pt")  # Custom trained model
 YOLO_CONFIDENCE_THRESHOLD = 0.6
 YOLO_IOU_THRESHOLD = 0.45
 
+# Vision Transformer (ViT) classifier for frame-level violence detection
+# This model is a classifier (violence / non-violence). It does NOT return bounding boxes.
+# Place the Hugging Face repo or extracted files in: models/vit-base-violence-detection/
+VIOLENCE_CLASSIFIER_DIR = str(MODELS_DIR / "vit-base-violence-detection")
+# Enable the ViT classifier. If True the consumer will run the classifier on frames
+USE_VIOLENCE_CLASSIFIER = True
+# Softmax probability threshold for the 'violence' class (0..1)
+VIOLENCE_CLASSIFIER_THRESHOLD = 0.6
+# How many frames to skip between classifier inferences (1 = every frame)
+VIOLENCE_CLASSIFIER_FRAME_SKIP = 3
+# Batch size for classifier inference (if using batched evaluation)
+VIOLENCE_CLASSIFIER_BATCH_SIZE = 8
+
 # Harmful object classes (customize based on your model)
+# For YOLOv8n default model (COCO dataset), use these real classes:
 HARMFUL_CLASSES = [
     "knife",
-    "gun",
-    "weapon",
-    "blood",
-    "violence",
-    "fight",
-    "pistol",
-    "rifle",
-    "sword",
-    "axe",
-    "explosive",
+    "scissors",
+    "person",  # Can detect person for violence context
+    # Note: Default YOLOv8 doesn't detect violence directly
+    # You need a custom-trained model for violence detection
 ]
+
+# Alternative: Use ALL detections for demo purposes
+# Set to False for real inference; True will mark every detection as harmful (testing only)
+USE_ALL_DETECTIONS_AS_HARMFUL = False  # Set True to test with any detection
 
 # Whisper model configuration
 WHISPER_MODEL = "base"  # Options: tiny, base, small, medium, large

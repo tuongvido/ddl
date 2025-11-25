@@ -93,7 +93,7 @@ def start_producer():
             "python",
             "/opt/airflow/src/producer.py",
             "--video",
-            "/opt/airflow/data/V_10.mp4",
+            "/opt/airflow/data/v001_converted.avi",
             "--loop",
         ],
         stdout=subprocess.PIPE,

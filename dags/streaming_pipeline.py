@@ -232,7 +232,7 @@ def generate_setup_report():
     logger.info("  1. Start Producer (Terminal 1):")
     logger.info("     cd D:/Code/doan")
     logger.info("     .venv\\Scripts\\activate")
-    logger.info("     python src/producer.py --video ./data/V_10.mp4 --loop")
+    logger.info("     python src/producer.py --video ./data/v001_converted.avi --loop")
     logger.info("")
     logger.info("  2. Start Video Consumer (Terminal 2):")
     logger.info("     cd D:/Code/doan")

@@ -43,7 +43,7 @@
 
 ### Video Processing
 
-- ✅ Video file loaded: V_10.mp4 (96 frames, 1920x1080)
+- ✅ Video file loaded: v001_converted.avi (96 frames, 1920x1080)
 - ✅ Frame extraction working
 - ✅ Base64 encoding working
 - ✅ Kafka publishing successful
@@ -127,7 +127,7 @@ doan/
 ### Run Producer
 
 ```powershell
-D:/Code/doan/.venv/Scripts/python.exe .\src\producer.py --video ./data/V_10.mp4 --loop
+D:/Code/doan/.venv/Scripts/python.exe .\src\producer.py --video ./data/v001_converted.avi --loop
 ```
 
 ### Run Consumers

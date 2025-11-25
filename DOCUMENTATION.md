@@ -85,6 +85,8 @@ doan/
 9. Xem kết quả trên Dashboard
 ```
 
+https://huggingface.co/jaranohaal/vit-base-violence-detection/resolve/main/model.safetensors?download=true
+
 ### 2. Lần Sau Sử Dụng
 
 ```
