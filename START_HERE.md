@@ -52,7 +52,7 @@ python init_project.py
 ```powershell
 # Terminal 1 - Producer
 cd src
-python producer.py --video ../data/v001_converted.avi --loop
+python producer.py --video ../data/V_10.mp4 --loop
 
 # Terminal 2 - Video Consumer
 cd src

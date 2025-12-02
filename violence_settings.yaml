@@ -1,0 +1,64 @@
+# Violence Detection Settings using CLIP Model
+# Optimized for Vietnamese traffic/security context
+
+model-settings:
+  # Confidence threshold for predictions (0.0 to 1.0)
+  # Recommended: 0.60 - 0.75 for CLIP
+  # < 0.50: Rất nhạy, dễ báo sai (False Positive)
+  # > 0.80: Rất chặt, có thể bỏ sót hành vi bạo lực nhanh
+  prediction-threshold: 0.65
+
+  # CLIP model variant
+  # 'ViT-B/32': Nhanh nhất, độ chính xác khá (Recommended for real-time)
+  # 'ViT-L/14': Chính xác nhất nhưng rất nặng và chậm
+  model-name: "ViT-B/32"
+
+  # Device: 'cuda' (NVIDIA GPU) or 'cpu'
+  device: "cuda"
+
+label-settings:
+  # IMPORTANT: The Python code relies on the order of these lists.
+  # It combines them into one list for the model.
+
+  non-violence-labels:
+    # 1. Normal daily activities
+    - "people walking peacefully on the street"
+    - "normal crowd walking"
+    - "people standing and talking"
+    - "people sitting in office or restaurant"
+
+    # 2. Confusing actions (Actions that look like violence but are safe)
+    # CLIP cần những label này để không nhầm lẫn
+    - "friends hugging or embracing" # Tránh nhầm với vật lộn
+    - "people shaking hands" # Tránh nhầm với gây gổ
+    - "people dancing or exercising" # Tránh nhầm với chuyển động nhanh
+    - "playing sports like football or basketball" # Tránh nhầm với va chạm
+    - "workers carrying objects" # Tránh nhầm với cầm vũ khí
+
+  violence-labels:
+    # 1. Physical fighting
+    - "violent street fight between people"
+    - "people punching and hitting each other"
+    - "person kicking another person"
+    - "aggressive physical assault"
+    - "people wrestling and fighting on the ground"
+
+    # 2. Weapons & Dangerous situations
+    - "person holding a weapon like knife or gun"
+    - "person holding a stick or bat aggressively"
+    - "bloody injury scene"
+    - "violent gang confrontation"
+
+  # Default label when confidence is too low
+  default-label: "Uncertain"
+
+# Frame processing settings
+processing-settings:
+  # Process every N frames.
+  # If video is 30 FPS:
+  # frame-skip: 1  -> Check 30 times/sec (Too heavy, unnecessary)
+  # frame-skip: 5  -> Check 6 times/sec (Good balance)
+  # frame-skip: 30 -> Check 1 time/sec (Might miss fast punches)
+  frame-skip: 5
+
+  batch-size: 1

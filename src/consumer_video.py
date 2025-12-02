@@ -1,5 +1,5 @@
 """
-Video Consumer: Process video frames and detect harmful content using YOLOv8
+Video Consumer: Process video frames and detect harmful content using CLIP model
 """
 
 import logging
@@ -11,18 +11,20 @@ from kafka.errors import KafkaError
 import json
 from typing import Dict, List, Any
 import cv2
+import numpy as np
 
+# Import configurations
 from config import (
     KAFKA_BOOTSTRAP_SERVERS,
     KAFKA_TOPIC_VIDEO,
-    VIOLENCE_CLASSIFIER_DIR,
     USE_VIOLENCE_CLASSIFIER,
     VIOLENCE_CLASSIFIER_THRESHOLD,
     VIOLENCE_CLASSIFIER_FRAME_SKIP,
-    VIOLENCE_CLASSIFIER_BATCH_SIZE,
     USE_ALL_DETECTIONS_AS_HARMFUL,
     LOG_LEVEL,
 )
+
+# Import utilities
 from utils import (
     decode_base64_to_image,
     calculate_alert_level,
@@ -32,452 +34,324 @@ from utils import (
 )
 
 # Configure logging
-logging.basicConfig(level=LOG_LEVEL)
+logging.basicConfig(
+    level=LOG_LEVEL, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
 logger = logging.getLogger(__name__)
 
-# Try to import classifier dependencies
+# --- Dependency Check ---
 try:
-    from transformers import AutoFeatureExtractor, AutoModelForImageClassification
     import torch
+    import clip
+    from PIL import Image
+    import yaml
 
-    CLASSIFIER_AVAILABLE = True
-except Exception:
+    CLIP_AVAILABLE = True
+except Exception as e:
     logger.warning(
-        "Transformers/torch not available. Install with: pip install transformers torch safetensors"
+        f"CLIP/torch dependencies missing: {e}. AI detection will be disabled."
     )
-    CLASSIFIER_AVAILABLE = False
+    CLIP_AVAILABLE = False
 
 
 class VideoConsumer:
     """Consumer for processing video frames and detecting harmful content"""
 
     def __init__(self, kafka_servers: str = KAFKA_BOOTSTRAP_SERVERS):
-        """
-        Initialize video consumer
-
-        Args:
-            kafka_servers: Kafka bootstrap servers
-        """
         self.kafka_servers = kafka_servers
         self.consumer = None
-        self.model = None
         self.db_handler = MongoDBHandler()
+        # Cooldown 5s để tránh spam 100 cái alert trong 1 giây nếu video đánh nhau dài
         self.alert_throttler = AlertThrottler(cooldown_seconds=5)
         self.frame_count = 0
 
-        logger.info("Initializing VideoConsumer")
+        # Biến chứa model
+        self.clip_model = None
+        self.clip_preprocess = None
+        self.device = None
+        self.text_features = None
+        self.violence_labels = []
+        self.violence_indices = []
 
-        # Load ViT classifier model (if enabled)
+        logger.info("Initializing VideoConsumer...")
         self.load_model()
 
     def load_model(self):
-        """Load ViT/frame-level violence classifier"""
-        self.classifier = None
-        self.feature_extractor = None
-        self.id2label = {}
-
+        """Load CLIP model and labels from YAML"""
         if not USE_VIOLENCE_CLASSIFIER:
-            logger.info("Violence classifier disabled by configuration")
+            logger.info("🚫 Violence classifier disabled by config.")
             return
 
-        if not CLASSIFIER_AVAILABLE:
-            logger.error("Transformers/torch not available; cannot load classifier")
+        if not CLIP_AVAILABLE:
+            logger.error("❌ CLIP not available. Cannot load model.")
             return
 
-        try:
-            model_dir = Path(VIOLENCE_CLASSIFIER_DIR)
+        # 1. Load Labels from YAML
+        settings_path = Path(__file__).parent.parent / "violence_settings.yaml"
+        non_violence = []
+        violence = []
 
-            # Support either a direct model directory or the huggingface_hub snapshot cache layout
-            chosen_dir = None
-            if model_dir.exists():
-                # direct layout
-                if (model_dir / "config.json").exists() or (
-                    model_dir / "preprocessor_config.json"
-                ).exists():
-                    chosen_dir = model_dir
-                else:
-                    # look for nested cache folder like models--<owner>--<repo>/snapshots/<id>/
-                    nested = list(model_dir.glob("models-*"))
-                    for n in nested:
-                        snaps = list(n.glob("snapshots/*"))
-                        for s in snaps:
-                            if (s / "config.json").exists() or (
-                                s / "preprocessor_config.json"
-                            ).exists():
-                                chosen_dir = s
-                                break
-                        if chosen_dir:
-                            break
-                    # fallback: search deeper
-                    if chosen_dir is None:
-                        snaps = list(model_dir.rglob("snapshots/*"))
-                        for s in snaps:
-                            if (s / "config.json").exists() or (
-                                s / "preprocessor_config.json"
-                            ).exists():
-                                chosen_dir = s
-                                break
-
-            if chosen_dir is None:
-                logger.warning(
-                    f"Violence classifier directory not found or missing config: {model_dir}"
-                )
-                logger.warning(
-                    "Place the Hugging Face model files in this folder (model.safetensors, config.json, preprocessor_config.json) or run snapshot_download to fetch the repo"
-                )
-                return
-
-            model_dir = chosen_dir
-
-            logger.info(f"Loading violence classifier from {model_dir}")
-            # Some repos use preprocessor_config.json / AutoImageProcessor instead of feature extractor
+        if settings_path.exists():
             try:
-                self.feature_extractor = AutoFeatureExtractor.from_pretrained(
-                    str(model_dir)
-                )
-            except Exception:
-                from transformers import AutoImageProcessor
+                with open(settings_path, "r", encoding="utf-8") as f:
+                    settings = yaml.safe_load(f)
 
-                self.feature_extractor = AutoImageProcessor.from_pretrained(
-                    str(model_dir)
-                )
+                label_settings = settings.get("label-settings", {})
+                non_violence = label_settings.get("non-violence-labels", [])
+                violence = label_settings.get("violence-labels", [])
 
-            self.classifier = AutoModelForImageClassification.from_pretrained(
-                str(model_dir), local_files_only=True
+                logger.info(
+                    f"Loaded labels from YAML: {len(non_violence)} Safe, {len(violence)} Violence"
+                )
+            except Exception as e:
+                logger.warning(f"Failed to read YAML: {e}. Using defaults.")
+
+        # Fallback labels if YAML fails
+        if not violence:
+            non_violence = ["peaceful scene", "people walking", "people talking"]
+            violence = ["fighting", "violence", "hitting", "weapons"]
+
+        # IMPORTANT: Order matters!
+        # Safe labels first, Violence labels second.
+        self.violence_labels = non_violence + violence
+        # Indices of violence labels start after the non-violence labels
+        self.violence_indices = list(
+            range(len(non_violence), len(self.violence_labels))
+        )
+
+        logger.info(f"Total Labels: {len(self.violence_labels)}")
+        logger.info(f"Violence Class IDs: {self.violence_indices}")
+
+        # 2. Load CLIP Model
+        try:
+            self.device = "cuda" if torch.cuda.is_available() else "cpu"
+            logger.info(f"Using AI Device: {self.device.upper()}")
+
+            # ViT-B/32 is fast and good for real-time
+            self.clip_model, self.clip_preprocess = clip.load(
+                "ViT-B/32", device=self.device
             )
 
-            # Move model to GPU if available
-            import torch
+            # 3. Precompute Text Embeddings (Make "Search Keys")
+            logger.info("Precomputing text embeddings...")
 
-            self.device = "cuda" if torch.cuda.is_available() else "cpu"
-            self.classifier.to(self.device)
+            # Prompt Engineering: "a photo of X" helps CLIP understand better
+            text_descriptions = [
+                f"a photo of {label}" for label in self.violence_labels
+            ]
+            text_tokens = clip.tokenize(text_descriptions).to(self.device)
 
-            # Setup id2label mapping
-            if (
-                hasattr(self.classifier.config, "id2label")
-                and self.classifier.config.id2label
-            ):
-                # Some checkpoints store generic labels like 'LABEL_0', 'LABEL_1'.
-                # Normalize to meaningful labels when possible.
-                raw = self.classifier.config.id2label
-                vals = set([str(v).upper() for v in raw.values()])
-                if any(v.startswith("LABEL_") for v in vals):
-                    # Assume convention: 0 = non-violence, 1 = violence
-                    self.id2label = {0: "non-violence", 1: "violence"}
-                else:
-                    self.id2label = raw
-            else:
-                # default mapping assumption
-                self.id2label = {0: "non-violence", 1: "violence"}
+            with torch.no_grad():
+                self.text_features = self.clip_model.encode_text(text_tokens)
+                self.text_features /= self.text_features.norm(dim=-1, keepdim=True)
 
-            logger.info("Violence classifier loaded successfully")
+            logger.info("✅ Model loaded and ready.")
 
         except Exception as e:
-            logger.error(f"Failed to load violence classifier: {e}")
-            self.classifier = None
+            logger.error(f"❌ Critical Error loading CLIP: {e}")
+            self.clip_model = None
 
     def connect_kafka(self):
-        """Connect to Kafka broker"""
+        """Connect to Kafka"""
         try:
             self.consumer = KafkaConsumer(
                 KAFKA_TOPIC_VIDEO,
                 bootstrap_servers=self.kafka_servers,
-                auto_offset_reset="latest",
+                auto_offset_reset="latest",  # Chỉ đọc tin nhắn mới nhất (Real-time)
                 enable_auto_commit=True,
                 group_id="video-processing-group",
                 value_deserializer=lambda m: json.loads(m.decode("utf-8")),
-                max_poll_records=10,
-                session_timeout_ms=30000,
+                max_poll_records=10,  # Không lấy quá nhiều 1 lúc tránh nghẽn
             )
-            logger.info(f"Connected to Kafka at {self.kafka_servers}")
-            logger.info(f"Subscribed to topic: {KAFKA_TOPIC_VIDEO}")
+            logger.info(f"✅ Connected to Kafka topic: {KAFKA_TOPIC_VIDEO}")
         except KafkaError as e:
-            logger.error(f"Failed to connect to Kafka: {e}")
+            logger.error(f"❌ Kafka Connection Failed: {e}")
             raise
 
     def detect_objects(self, frame) -> List[Dict[str, Any]]:
         """
-        Run frame-level violence classification and return detections list.
-
-        Args:
-            frame: OpenCV BGR frame (numpy array)
-
-        Returns:
-            List of detections in the form [{"class": str, "confidence": float, "class_id": int}]
+        Core AI Logic: Classify frame using CLIP
         """
-        # If classifier not in use or not loaded, return empty
-        if (
-            not USE_VIOLENCE_CLASSIFIER
-            or not self.classifier
-            or not self.feature_extractor
-        ):
+        # Checks
+        if not USE_VIOLENCE_CLASSIFIER or self.clip_model is None:
+            return []
+
+        # Frame Skip (Optimization)
+        if self.frame_count % VIOLENCE_CLASSIFIER_FRAME_SKIP != 0:
             return []
 
         try:
-            # Frame skip logic
-            if self.frame_count % VIOLENCE_CLASSIFIER_FRAME_SKIP != 0:
-                return []
+            # 1. Preprocessing
+            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            pil_image = Image.fromarray(rgb_frame)
+            image_input = self.clip_preprocess(pil_image).unsqueeze(0).to(self.device)
 
-            # Convert BGR (OpenCV) to RGB
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-
-            # Prepare inputs
-            inputs = self.feature_extractor(images=rgb, return_tensors="pt")
-
-            # Move tensors to device
-            import torch
-
-            inputs = {k: v.to(self.device) for k, v in inputs.items()}
-
+            # 2. Inference (AI Thinking)
             with torch.no_grad():
-                outputs = self.classifier(**inputs)
-                probs = (
-                    torch.nn.functional.softmax(outputs.logits, dim=-1).cpu().numpy()[0]
-                )
+                image_features = self.clip_model.encode_image(image_input)
+                image_features /= image_features.norm(dim=-1, keepdim=True)
 
-            # Build top-k label details
-            top_k = min(3, len(probs))
-            top_indices = probs.argsort()[::-1][:top_k]
-            label_details = []
-            for idx in top_indices:
-                lbl = self.id2label.get(int(idx), str(idx))
-                prob = float(probs[int(idx)])
-                label_details.append({"label": str(lbl), "prob": prob, "id": int(idx)})
+                # Similarity Calculation
+                similarity = (image_features @ self.text_features.T).squeeze(0)
+                probs = torch.nn.functional.softmax(similarity, dim=0).cpu().numpy()
 
-            # Determine if any top label indicates violence.
-            # Prefer checking class_id (1 == violence) when available to avoid substring issues
-            is_violation = False
-            violence_best = None
-            # First, look for positive-class id (commonly 1) with sufficient probability
-            for item in label_details:
-                if (
-                    int(item.get("id", -1)) == 1
-                    and item["prob"] >= VIOLENCE_CLASSIFIER_THRESHOLD
-                ):
-                    is_violation = True
-                    violence_best = item
-                    break
-
-            # Fallback: check explicit label equality (avoid substring matches like 'non-violence')
-            if not is_violation:
-                for item in label_details:
-                    lbl = item["label"].lower().strip()
-                    # treat exact 'violence' or 'violent' as positive
-                    if (
-                        lbl in ("violence", "violent")
-                        and item["prob"] >= VIOLENCE_CLASSIFIER_THRESHOLD
-                    ):
-                        is_violation = True
-                        violence_best = item
-                        break
+            # 3. Analysis
+            # Get the single highest probability label (Top 1)
+            top_idx = int(probs.argmax())
+            top_prob = float(probs[top_idx])
+            top_label = self.violence_labels[top_idx]
 
             detections = []
-            if is_violation:
-                detections.append(
-                    {
-                        "bbox": None,
-                        "confidence": violence_best["prob"],
-                        "class": violence_best["label"],
-                        "class_id": violence_best["id"],
-                        "label_details": label_details,
-                    }
-                )
+
+            # --- LOGIC QUYẾT ĐỊNH (FIXED) ---
+
+            # Case A: Phát hiện bạo lực
+            if top_idx in self.violence_indices:
+                if top_prob >= VIOLENCE_CLASSIFIER_THRESHOLD:
+                    logger.warning(
+                        f"🚨 VIOLENCE DETECTED: '{top_label}' ({top_prob:.1%})"
+                    )
+                    detections.append(
+                        {
+                            "class": top_label,
+                            "class_id": top_idx,
+                            "confidence": top_prob,
+                            "bbox": None,  # CLIP is classification, not detection
+                        }
+                    )
+                else:
+                    # Có vẻ là bạo lực nhưng độ tin cậy thấp (dưới ngưỡng)
+                    logger.debug(
+                        f"Potential violence ignored (Low confidence): '{top_label}' ({top_prob:.1%})"
+                    )
+
+            # Case B: An toàn
+            else:
+                # Log debug để biết model đang nhìn thấy gì (Rất có ích để chỉnh file YAML)
+                if self.frame_count % 30 == 0:  # Log mỗi 30 frame cho đỡ rác
+                    logger.debug(f"Safe scene: '{top_label}' ({top_prob:.1%})")
 
             return detections
 
         except Exception as e:
-            logger.error(f"Classifier detection error: {e}")
+            logger.error(f"Detection Error: {e}")
             return []
 
     def check_harmful_content(self, detections: List[Dict]) -> Dict[str, Any]:
         """
-        Check if detected objects are harmful
-
-        Args:
-            detections: List of detected objects
-
-        Returns:
-            Dictionary with harmful content information
+        Filter harmful detections.
+        FIX: Removed string matching logic. Now purely relies on detect_objects result.
         """
-        harmful_detections = []
 
-        # Demo mode: treat ALL detections as harmful for testing
-        if USE_ALL_DETECTIONS_AS_HARMFUL:
-            harmful_detections = detections
-        else:
-            # If using the ViT classifier, any returned 'violence' detection is harmful
-            if USE_VIOLENCE_CLASSIFIER:
-                for det in detections:
-                    # classifier returns class like 'violence' when positive
-                    class_name = str(det.get("class", "")).lower()
-                    if "violence" in class_name:
-                        harmful_detections.append(det)
-            else:
-                # Fallback: if detections include objects matching HARMFUL_CLASSES
-                for det in detections:
-                    class_name = det.get("class", "").lower()
-                    # Check if object class is in harmful list
-                    for harmful_class in []:
-                        if harmful_class.lower() in class_name:
-                            harmful_detections.append(det)
-                            break
-
-        is_harmful = len(harmful_detections) > 0
-
-        result = {
-            "is_harmful": is_harmful,
-            "harmful_detections": harmful_detections,
+        return {
+            "is_harmful": len(detections) > 0,
+            "harmful_detections": detections,
             "total_detections": len(detections),
-            "harmful_count": len(harmful_detections),
+            "harmful_count": len(detections),
         }
 
-        return result
-
     def process_frame(self, message: Dict[str, Any]):
-        """
-        Process a video frame message
-
-        Args:
-            message: Kafka message containing frame data
-        """
+        """Process individual frame from Kafka"""
         try:
             frame_id = message.get("frame_id", -1)
             timestamp = message.get("timestamp", time.time())
             frame_data = message.get("data", "")
 
             if not frame_data:
-                logger.warning(f"Empty frame data for frame {frame_id}")
                 return
 
-            # Decode frame
             frame = decode_base64_to_image(frame_data)
-
             if frame is None:
-                logger.warning(f"Failed to decode frame {frame_id}")
                 return
-
-            # Detect objects
-            detections = self.detect_objects(frame)
-
-            # Check for harmful content
-            harmful_result = self.check_harmful_content(detections)
-
-            # Save detection result to database
-            detection_record = {
-                "frame_id": frame_id,
-                "timestamp": timestamp,
-                "total_detections": harmful_result["total_detections"],
-                "harmful_count": harmful_result["harmful_count"],
-                "is_harmful": harmful_result["is_harmful"],
-                "detections": detections,
-                "harmful_detections": harmful_result["harmful_detections"],
-            }
-
-            self.db_handler.save_detection(detection_record)
-
-            # If harmful content detected, generate alert
-            if harmful_result["is_harmful"]:
-                self.generate_alert(frame_id, harmful_result, frame)
 
             self.frame_count += 1
 
-            if self.frame_count % 50 == 0:
-                logger.info(f"Processed {self.frame_count} frames")
+            # 1. Detect
+            detections = self.detect_objects(frame)
 
-        except Exception as e:
-            logger.error(f"Error processing frame: {e}")
+            # 2. Check Harmful
+            result = self.check_harmful_content(detections)
 
-    def generate_alert(self, frame_id: int, harmful_result: Dict, frame):
-        """
-        Generate alert for harmful content
-
-        Args:
-            frame_id: Frame ID
-            harmful_result: Harmful content detection result
-            frame: OpenCV frame
-        """
-        try:
-            harmful_detections = harmful_result["harmful_detections"]
-
-            for det in harmful_detections:
-                detection_type = det["class"]
-                confidence = det["confidence"]
-
-                # Calculate alert level
-                alert_level = calculate_alert_level(detection_type, confidence)
-
-                # Check if we should send alert (throttling)
-                alert_key = f"video_{detection_type}"
-
-                if not self.alert_throttler.should_send_alert(alert_key):
-                    logger.debug(f"Alert throttled for {detection_type}")
-                    continue
-
-                # Create alert
-                alert_data = {
-                    "source": "video",
-                    "frame_id": frame_id,
-                    "detection_type": detection_type,
-                    "confidence": confidence,
-                    "level": alert_level,
-                    "bbox": det.get("bbox"),
-                    "details": f"Detected {detection_type} with confidence {confidence:.2%}",
-                }
-
-                # Save alert to database
-                self.db_handler.save_alert(alert_data)
-
-                # Save frame for training
-                save_image_for_training(frame, detection_type)
-
-                logger.warning(
-                    f"⚠️ ALERT [{alert_level}]: Detected {detection_type} "
-                    f"(confidence: {confidence:.2%}) in frame {frame_id}"
+            # 3. Database & Alert
+            if result["is_harmful"]:
+                # Save to DB
+                self.db_handler.save_detection(
+                    {
+                        "frame_id": frame_id,
+                        "timestamp": timestamp,
+                        "detections": result["harmful_detections"],
+                        "is_harmful": True,
+                    }
                 )
 
+                # Generate Alert
+                self.generate_alert(frame_id, result, frame)
+
+            # Progress Log
+            if self.frame_count % 100 == 0:
+                logger.info(f"Processed {self.frame_count} frames...")
+
         except Exception as e:
-            logger.error(f"Error generating alert: {e}")
+            logger.error(f"Frame Processing Error: {e}")
+
+    def generate_alert(self, frame_id: int, harmful_result: Dict, frame):
+        """Send alert if throttler allows"""
+        try:
+            for det in harmful_result["harmful_detections"]:
+                det_type = det["class"]
+                conf = det["confidence"]
+
+                # Throttling Key: "video_fighting", "video_weapon", etc.
+                alert_key = f"video_{det_type}"
+
+                if self.alert_throttler.should_send_alert(alert_key):
+                    level = calculate_alert_level(det_type, conf)
+
+                    alert_data = {
+                        "source": "video",
+                        "frame_id": frame_id,
+                        "detection_type": det_type,
+                        "confidence": conf,
+                        "level": level,
+                        "details": f"Detected {det_type} ({conf:.1%})",
+                    }
+
+                    # 1. Save Alert DB
+                    self.db_handler.save_alert(alert_data)
+
+                    # 2. Save Evidence Image
+                    save_image_for_training(frame, det_type)
+
+                    logger.warning(f"⚠️  ALERT SENT: {det_type} - Frame {frame_id}")
+
+        except Exception as e:
+            logger.error(f"Alert Gen Error: {e}")
 
     def run(self):
-        """Run the consumer"""
+        """Main Loop"""
         try:
             self.connect_kafka()
-
-            logger.info("Starting video consumer...")
-            logger.info("Waiting for messages...")
+            logger.info("waiting for stream...")
 
             for message in self.consumer:
                 self.process_frame(message.value)
 
         except KeyboardInterrupt:
-            logger.info("Consumer stopped by user")
-        except Exception as e:
-            logger.error(f"Consumer error: {e}")
-            raise
+            logger.info("Stopping consumer...")
         finally:
             self.cleanup()
 
     def cleanup(self):
-        """Cleanup resources"""
         if self.consumer:
             self.consumer.close()
-            logger.info("Kafka consumer closed")
-
         if self.db_handler:
             self.db_handler.close()
-            logger.info("Database connection closed")
+        logger.info("Cleanup done.")
 
 
 def main():
-    """Main entry point"""
-    parser = argparse.ArgumentParser(description="Video Consumer")
-    parser.add_argument(
-        "--kafka",
-        type=str,
-        default=KAFKA_BOOTSTRAP_SERVERS,
-        help="Kafka bootstrap servers",
-    )
-
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--kafka", type=str, default=KAFKA_BOOTSTRAP_SERVERS)
     args = parser.parse_args()
 
     consumer = VideoConsumer(args.kafka)

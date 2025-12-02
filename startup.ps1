@@ -36,7 +36,7 @@ Write-Host "`n[OK] System is ready!" -ForegroundColor Green
 Write-Host "`n[INFO] Next steps:" -ForegroundColor Cyan
 Write-Host "1. Place your test video in the data/ folder" -ForegroundColor White
 Write-Host "2. Open 3 new PowerShell terminals and run:" -ForegroundColor White
-Write-Host "   Terminal 1: cd src; python ./src/producer.py --video ./data/v001_converted.avi --loop" -ForegroundColor Yellow
+Write-Host "   Terminal 1: cd src; python ./src/producer.py --video ./data/V_10.mp4 --loop" -ForegroundColor Yellow
 Write-Host "   Terminal 2: cd src; python ./src/consumer_video.py" -ForegroundColor Yellow
 Write-Host "   Terminal 3: cd src; python ./src/consumer_audio.py" -ForegroundColor Yellow
 Write-Host "3. Open another terminal for dashboard:" -ForegroundColor White

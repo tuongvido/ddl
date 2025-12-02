@@ -163,7 +163,7 @@ def download_violence_model():
         print("   1. Check models/violence_detection.pt exists")
         print("   2. Update config.py if needed")
         print("   3. Restart consumer: python src/consumer_video.py")
-        print("   4. Test with: python src/producer.py --video data/v001_converted.avi")
+        print("   4. Test with: python src/producer.py --video data/V_10.mp4")
 
         return True
 

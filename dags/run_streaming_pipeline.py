@@ -86,6 +86,7 @@ def start_producer():
     logger.info("=" * 60)
     logger.info("STARTING PRODUCER")
     logger.info("=" * 60)
+    logger.info("Using video file: /opt/airflow/data/V_10.mp4")
 
     # Start producer as background process
     process = subprocess.Popen(
@@ -93,7 +94,7 @@ def start_producer():
             "python",
             "/opt/airflow/src/producer.py",
             "--video",
-            "/opt/airflow/data/v001_converted.avi",
+            "/opt/airflow/data/V_10.mp4",
             "--loop",
         ],
         stdout=subprocess.PIPE,

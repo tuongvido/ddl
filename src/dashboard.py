@@ -1,23 +1,25 @@
 """
 Streamlit Dashboard for Real-time Harmful Content Detection Monitoring
+Upgraded Version: Includes Image Evidence, Working Time Filters, and Grid Layout.
 """
 
 import streamlit as st
 import pandas as pd
 import plotly.express as px
-from datetime import datetime
+from datetime import datetime, timedelta
 import time
-from utils import MongoDBHandler
+import cv2
+from utils import MongoDBHandler, decode_base64_to_image
 
-# Page configuration
+# --- 1. CONFIGURATION ---
 st.set_page_config(
-    page_title="Harmful Content Detection Dashboard",
+    page_title="Harmful Content Monitor",
     page_icon="🚨",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-# Custom CSS
+# Custom CSS for styling
 st.markdown(
     """
 <style>
@@ -27,343 +29,277 @@ st.markdown(
         border-radius: 10px;
         margin: 10px 0;
     }
-    .alert-high {
-        background-color: #ffebee;
-        border-left: 5px solid #f44336;
+    .alert-card {
         padding: 10px;
-        margin: 5px 0;
+        border-radius: 5px;
+        margin-bottom: 10px;
+        border-left: 5px solid #ccc;
     }
-    .alert-medium {
-        background-color: #fff3e0;
-        border-left: 5px solid #ff9800;
-        padding: 10px;
-        margin: 5px 0;
-    }
-    .alert-low {
-        background-color: #fff9c4;
-        border-left: 5px solid #ffeb3b;
-        padding: 10px;
-        margin: 5px 0;
-    }
+    .alert-HIGH { background-color: #ffebee; border-color: #f44336; }
+    .alert-MEDIUM { background-color: #fff3e0; border-color: #ff9800; }
+    .alert-LOW { background-color: #fff9c4; border-color: #ffeb3b; }
+    
+    /* Image Grid Styling */
+    .stImage { border-radius: 5px; }
 </style>
 """,
     unsafe_allow_html=True,
 )
 
 
+# --- 2. HELPER FUNCTIONS ---
+
+
 @st.cache_resource
 def get_db_handler():
-    """Get MongoDB handler (cached)"""
+    """Get MongoDB handler (cached to avoid reconnecting)"""
     return MongoDBHandler()
 
 
 def format_timestamp(ts):
     """Format timestamp for display"""
-    if isinstance(ts, str):
-        return ts
-    return ts.strftime("%Y-%m-%d %H:%M:%S") if ts else "N/A"
+    if not ts:
+        return "N/A"
+    return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
 
 
-def display_alert(alert):
-    """Display single alert"""
+def get_start_time(time_range_str):
+    """Convert dropdown selection to actual timestamp"""
+    now = datetime.now()
+    if time_range_str == "Last 1 hour":
+        return (now - timedelta(hours=1)).timestamp()
+    elif time_range_str == "Last 6 hours":
+        return (now - timedelta(hours=6)).timestamp()
+    elif time_range_str == "Last 24 hours":
+        return (now - timedelta(hours=24)).timestamp()
+    elif time_range_str == "Last 7 days":
+        return (now - timedelta(days=7)).timestamp()
+    return (now - timedelta(hours=1)).timestamp()  # Default
+
+
+def display_alert_row(alert):
+    """Render a single alert using HTML/CSS"""
     level = alert.get("level", "LOW")
-    detection_type = alert.get("detection_type", "Unknown")
-    timestamp = format_timestamp(alert.get("timestamp"))
+    ts = format_timestamp(alert.get("timestamp"))
     details = alert.get("details", "")
-    confidence = alert.get("confidence", 0)
-
-    alert_class = f"alert-{level.lower()}"
+    type_ = alert.get("detection_type", "Unknown")
+    conf = alert.get("confidence", 0)
 
     st.markdown(
         f"""
-    <div class="{alert_class}">
-        <strong>🚨 {level} ALERT</strong> - {detection_type}<br>
-        <small>Time: {timestamp} | Confidence: {confidence:.1%}</small><br>
-        {details}
-    </div>
-    """,
+        <div class="alert-card alert-{level}">
+            <strong>🚨 [{level}] {type_}</strong> <span style="float:right">{ts}</span><br>
+            <small>Confidence: {conf:.1%}</small><br>
+            {details}
+        </div>
+        """,
         unsafe_allow_html=True,
     )
 
 
+# --- 3. MAIN DASHBOARD LOGIC ---
+
+
+def convert_to_timestamp(ts):
+    """Convert timestamp to float if it's a datetime object"""
+    if isinstance(ts, datetime):
+        return ts.timestamp()
+    return float(ts) if ts else 0
+
+
 def main():
-    """Main dashboard"""
+    st.title("🚨 Livestream Security Monitor")
+    st.markdown("Real-time AI analysis for harmful content detection")
 
-    # Title
-    st.title("🚨 Harmful Content Detection Dashboard")
-    st.markdown("Real-time monitoring of livestream content analysis")
+    # --- SIDEBAR: SETTINGS ---
+    st.sidebar.title("⚙️ Configuration")
 
-    # Sidebar
-    st.sidebar.title("⚙️ Settings")
-
-    # Auto-refresh settings
+    # Auto-refresh
     auto_refresh = st.sidebar.checkbox("Auto Refresh", value=True)
-    refresh_interval = st.sidebar.slider("Refresh Interval (seconds)", 1, 30, 5)
+    refresh_rate = st.sidebar.slider("Refresh Rate (seconds)", 3, 60, 5)
 
-    # Time range filter
-    st.sidebar.selectbox(
+    # Filters
+    st.sidebar.subheader("Filters")
+    time_range = st.sidebar.selectbox(
         "Time Range", ["Last 1 hour", "Last 6 hours", "Last 24 hours", "Last 7 days"]
     )
-
-    # Alert level filter
-    alert_levels = st.sidebar.multiselect(
+    selected_levels = st.sidebar.multiselect(
         "Alert Levels", ["HIGH", "MEDIUM", "LOW"], default=["HIGH", "MEDIUM", "LOW"]
     )
 
-    # Get database handler
+    # --- DATA FETCHING ---
     try:
         db = get_db_handler()
     except Exception as e:
-        st.error(f"Failed to connect to database: {e}")
+        st.error(f"❌ Database Error: {e}")
         st.stop()
 
-    # Main content area
+    # Calculate timestamps
+    start_ts = get_start_time(time_range)
+
+    # Fetch data (Fetching a bit more to filter in Python for simplicity)
+    raw_detections = db.get_recent_detections(limit=1000)
+    raw_alerts = db.get_recent_alerts(limit=500)
+
+    # Apply Filters (Time & Level)
+    detections = [
+        d
+        for d in raw_detections
+        if convert_to_timestamp(d.get("timestamp", 0)) >= start_ts
+    ]
+
+    alerts = [
+        a
+        for a in raw_alerts
+        if convert_to_timestamp(a.get("timestamp", 0)) >= start_ts
+        and a.get("level", "LOW") in selected_levels
+    ]
+
+    # --- TABS LAYOUT ---
     tab1, tab2, tab3, tab4 = st.tabs(
-        ["📊 Overview", "🚨 Alerts", "📹 Video Detection", "🎤 Audio Detection"]
+        ["📊 Overview", "🚨 Alerts Log", "📹 Video Evidence", "🎤 Audio Analysis"]
     )
 
+    # === TAB 1: OVERVIEW ===
     with tab1:
-        st.header("System Overview")
-
-        # Metrics row
+        # Top Metrics
         col1, col2, col3, col4 = st.columns(4)
 
-        # Get recent data
-        recent_detections = db.get_recent_detections(limit=1000)
-        recent_alerts = db.get_recent_alerts(limit=100)
+        harmful_count = len([d for d in detections if d.get("is_harmful")])
+        high_priority = len([a for a in alerts if a.get("level") == "HIGH"])
 
-        # Calculate metrics
-        total_detections = len(recent_detections)
-        harmful_detections = sum(1 for d in recent_detections if d.get("is_harmful"))
-        total_alerts = len(recent_alerts)
-        high_alerts = sum(1 for a in recent_alerts if a.get("level") == "HIGH")
+        col1.metric("Total Frames Analyzed", len(detections))
+        col2.metric("Harmful Detections", harmful_count)
+        col3.metric("Total Alerts", len(alerts))
+        col4.metric("High Priority", high_priority)
 
-        with col1:
-            st.metric("Total Detections", total_detections)
-
-        with col2:
-            st.metric(
-                "Harmful Content",
-                harmful_detections,
-                delta=f"{(harmful_detections / total_detections * 100):.1f}%"
-                if total_detections > 0
-                else "0%",
-            )
-
-        with col3:
-            st.metric("Total Alerts", total_alerts)
-
-        with col4:
-            st.metric(
-                "High Priority",
-                high_alerts,
-                delta=f"{(high_alerts / total_alerts * 100):.1f}%"
-                if total_alerts > 0
-                else "0%",
-            )
-
-        st.markdown("---")
+        st.divider()
 
         # Charts
-        col1, col2 = st.columns(2)
+        c1, c2 = st.columns(2)
 
-        with col1:
-            st.subheader("Alert Distribution by Level")
-            if recent_alerts:
-                alert_levels_count = {}
-                for alert in recent_alerts:
-                    level = alert.get("level", "UNKNOWN")
-                    alert_levels_count[level] = alert_levels_count.get(level, 0) + 1
-
-                fig = px.pie(
-                    values=list(alert_levels_count.values()),
-                    names=list(alert_levels_count.keys()),
-                    color=list(alert_levels_count.keys()),
+        with c1:
+            st.subheader("Alerts Timeline")
+            if alerts:
+                df_alerts = pd.DataFrame(alerts)
+                df_alerts["datetime"] = pd.to_datetime(df_alerts["timestamp"], unit="s")
+                fig = px.scatter(
+                    df_alerts,
+                    x="datetime",
+                    y="confidence",
+                    color="level",
+                    symbol="detection_type",
                     color_discrete_map={
-                        "HIGH": "#f44336",
-                        "MEDIUM": "#ff9800",
-                        "LOW": "#ffeb3b",
+                        "HIGH": "red",
+                        "MEDIUM": "orange",
+                        "LOW": "gold",
                     },
                 )
-                st.plotly_chart(fig, width="stretch")
+                st.plotly_chart(fig, use_container_width=True)
             else:
-                st.info("No alerts yet")
+                st.info("No alerts in this period.")
 
-        with col2:
-            st.subheader("Detection Types")
-            if recent_alerts:
-                detection_types = {}
-                for alert in recent_alerts:
-                    det_type = alert.get("detection_type", "Unknown")
-                    detection_types[det_type] = detection_types.get(det_type, 0) + 1
+        with c2:
+            st.subheader("Detection Distribution")
+            if alerts:
+                counts = {}
+                for a in alerts:
+                    t = a.get("detection_type", "Unknown")
+                    counts[t] = counts.get(t, 0) + 1
 
-                fig = px.bar(
-                    x=list(detection_types.keys()),
-                    y=list(detection_types.values()),
-                    labels={"x": "Detection Type", "y": "Count"},
-                    color=list(detection_types.values()),
-                    color_continuous_scale="reds",
+                fig = px.pie(
+                    names=list(counts.keys()), values=list(counts.values()), hole=0.4
                 )
-                st.plotly_chart(fig, width="stretch")
+                st.plotly_chart(fig, use_container_width=True)
             else:
-                st.info("No detections yet")
+                st.info("No data available.")
 
-        # Timeline
-        st.subheader("Alert Timeline")
-        if recent_alerts:
-            # Create timeline data
-            timeline_data = []
-            for alert in recent_alerts:
-                timeline_data.append(
-                    {
-                        "timestamp": alert.get("timestamp"),
-                        "level": alert.get("level", "UNKNOWN"),
-                        "type": alert.get("detection_type", "Unknown"),
-                        "confidence": alert.get("confidence", 0),
-                    }
-                )
-
-            df = pd.DataFrame(timeline_data)
-            df["timestamp"] = pd.to_datetime(df["timestamp"])
-
-            fig = px.scatter(
-                df,
-                x="timestamp",
-                y="confidence",
-                color="level",
-                symbol="type",
-                color_discrete_map={
-                    "HIGH": "#f44336",
-                    "MEDIUM": "#ff9800",
-                    "LOW": "#ffeb3b",
-                },
-                hover_data=["type", "level"],
-            )
-            fig.update_layout(height=400)
-            st.plotly_chart(fig, width="stretch")
-        else:
-            st.info("No timeline data yet")
-
+    # === TAB 2: ALERTS LOG ===
     with tab2:
-        st.header("Recent Alerts")
+        st.subheader("Live Alert Feed")
+        if alerts:
+            for alert in alerts[:20]:  # Show latest 20
+                display_alert_row(alert)
 
-        # Filter alerts
-        filtered_alerts = [
-            a for a in recent_alerts if a.get("level", "LOW") in alert_levels
+            if len(alerts) > 20:
+                st.caption(f"... and {len(alerts) - 20} more alerts.")
+        else:
+            st.success("No alerts matching filters.")
+
+    # === TAB 3: VIDEO EVIDENCE (Major Upgrade) ===
+    with tab3:
+        st.subheader("📸 Harmful Content Gallery")
+
+        # Filter only detections that are harmful AND have image data
+        harmful_frames = [d for d in detections if d.get("is_harmful") and "data" in d]
+
+        if harmful_frames:
+            st.warning(f"Found {len(harmful_frames)} frames with harmful content.")
+
+            # Grid Layout (3 Columns)
+            cols = st.columns(3)
+
+            # Show latest 30 frames to avoid memory issues
+            for idx, item in enumerate(harmful_frames[:30]):
+                col = cols[idx % 3]  # Distribute items across columns
+
+                with col:
+                    with st.container(border=True):
+                        # Decode & Display Image
+                        try:
+                            img = decode_base64_to_image(item["data"])
+                            if img is not None:
+                                # OpenCV is BGR, Streamlit needs RGB/BGR specified
+                                # Use channels="BGR" to let Streamlit know format
+                                st.image(img, channels="BGR", use_container_width=True)
+                            else:
+                                st.error("Image decode failed")
+                        except Exception:
+                            st.error("Image error")
+
+                        # Meta info
+                        ts = format_timestamp(item.get("timestamp"))
+                        st.markdown(f"**Time:** {ts}")
+
+                        # List Detections
+                        for det in item.get("harmful_detections", []):
+                            st.markdown(
+                                f"🔴 **{det.get('class')}**: {det.get('confidence', 0):.1%}"
+                            )
+        else:
+            st.success("No harmful video frames detected in this period.")
+
+    # === TAB 4: AUDIO ANALYSIS ===
+    with tab4:
+        st.subheader("🎙️ Audio Transcripts (Simulated)")
+
+        # Filter for audio chunks (assumes structure based on your data)
+        audio_chunks = [
+            d
+            for d in raw_detections
+            if "chunk_id" in d
+            and convert_to_timestamp(d.get("timestamp", 0)) >= start_ts
         ]
 
-        if filtered_alerts:
-            st.write(f"Showing {len(filtered_alerts)} alerts")
+        if audio_chunks:
+            for chunk in audio_chunks[:10]:
+                is_toxic = chunk.get("is_toxic", False)
+                score = chunk.get("toxic_score", 0)
+                text = chunk.get("transcribed_text", "No speech detected")
 
-            # Display alerts
-            for alert in filtered_alerts[:20]:  # Show last 20
-                display_alert(alert)
-        else:
-            st.info("No alerts matching the selected filters")
-
-    with tab3:
-        st.header("Video Detection Results")
-
-        # Get video detections
-        video_detections = [d for d in recent_detections if "frame_id" in d]
-
-        if video_detections:
-            st.write(f"Total frames processed: {len(video_detections)}")
-
-            # Stats
-            col1, col2, col3 = st.columns(3)
-
-            with col1:
-                harmful_frames = sum(1 for d in video_detections if d.get("is_harmful"))
-                st.metric(
-                    "Harmful Frames",
-                    harmful_frames,
-                    delta=f"{(harmful_frames / len(video_detections) * 100):.1f}%",
-                )
-
-            with col2:
-                total_objects = sum(
-                    d.get("total_detections", 0) for d in video_detections
-                )
-                st.metric("Total Objects Detected", total_objects)
-
-            with col3:
-                harmful_objects = sum(
-                    d.get("harmful_count", 0) for d in video_detections
-                )
-                st.metric("Harmful Objects", harmful_objects)
-
-            # Recent detections table
-            st.subheader("Recent Detections")
-
-            detection_data = []
-            for det in video_detections[:50]:
-                detection_data.append(
-                    {
-                        "Frame ID": det.get("frame_id"),
-                        "Timestamp": format_timestamp(det.get("timestamp")),
-                        "Total Detections": det.get("total_detections", 0),
-                        "Harmful": det.get("is_harmful", False),
-                        "Harmful Count": det.get("harmful_count", 0),
-                    }
-                )
-
-            df = pd.DataFrame(detection_data)
-            st.dataframe(df, width="stretch")
-        else:
-            st.info("No video detections yet")
-
-    with tab4:
-        st.header("Audio Detection Results")
-
-        # Get audio detections
-        audio_detections = [d for d in recent_detections if "chunk_id" in d]
-
-        if audio_detections:
-            st.write(f"Total audio chunks processed: {len(audio_detections)}")
-
-            # Stats
-            col1, col2 = st.columns(2)
-
-            with col1:
-                toxic_chunks = sum(1 for d in audio_detections if d.get("is_toxic"))
-                st.metric(
-                    "Toxic Speech Detected",
-                    toxic_chunks,
-                    delta=f"{(toxic_chunks / len(audio_detections) * 100):.1f}%",
-                )
-
-            with col2:
-                total_toxic_score = sum(
-                    d.get("toxic_score", 0) for d in audio_detections
-                )
-                st.metric("Total Toxic Keywords", total_toxic_score)
-
-            # Recent transcriptions
-            st.subheader("Recent Transcriptions")
-
-            for det in audio_detections[:10]:
-                if det.get("is_toxic"):
-                    st.warning(f"""
-                    **Chunk {det.get("chunk_id")}** - Toxic Score: {det.get("toxic_score", 0)}  
-                    Keywords: {", ".join(det.get("matched_keywords", []))}  
-                    Text: {det.get("transcribed_text", "N/A")}
-                    """)
+                if is_toxic:
+                    st.error(f'**Toxic Audio** (Score: {score})\n\n> "{text}"')
                 else:
-                    st.info(f"""
-                    **Chunk {det.get("chunk_id")}** - Clean  
-                    Text: {det.get("transcribed_text", "N/A")}
-                    """)
+                    st.info(f'**Clean Audio**\n\n> "{text}"')
         else:
-            st.info("No audio detections yet")
+            st.info("No audio data available yet.")
 
-    # Footer
+    # --- FOOTER & REFRESH ---
     st.markdown("---")
-    st.caption(f"Last updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    st.caption(f"Last updated: {datetime.now().strftime('%H:%M:%S')}")
 
-    # Auto-refresh
     if auto_refresh:
-        time.sleep(refresh_interval)
+        time.sleep(refresh_rate)
         st.rerun()
 
 
