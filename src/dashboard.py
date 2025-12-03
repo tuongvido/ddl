@@ -8,7 +8,6 @@ import pandas as pd
 import plotly.express as px
 from datetime import datetime, timedelta
 import time
-import cv2
 from utils import MongoDBHandler, decode_base64_to_image
 
 # --- 1. CONFIGURATION ---

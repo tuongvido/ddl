@@ -7,10 +7,12 @@ USER root
 RUN apt-get update && apt-get install -y \
     libgl1-mesa-glx \
     libglib2.0-0 \
+    git \
     && rm -rf /var/lib/apt/lists/*
 
 USER airflow
 
-# Install Python dependencies
+# Install Python dependencies với cache mount để tránh download lại packages
 COPY requirements.txt /tmp/requirements.txt
-RUN pip install --no-cache-dir -r /tmp/requirements.txt
+RUN --mount=type=cache,target=/home/airflow/.cache/pip \
+    pip install -r /tmp/requirements.txt

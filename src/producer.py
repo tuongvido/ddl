@@ -11,6 +11,10 @@ from pathlib import Path
 from kafka import KafkaProducer
 from kafka.errors import KafkaError
 import numpy as np
+from moviepy import VideoFileClip
+import base64
+import tempfile
+import os
 
 from config import (
     KAFKA_BOOTSTRAP_SERVERS,
@@ -47,6 +51,14 @@ class LivestreamProducer:
         self.video_capture = None
         self.frame_count = 0
         self.audio_chunk_count = 0
+
+        try:
+            self.video_clip = VideoFileClip(video_path)
+            self.audio_clip = self.video_clip.audio
+            logger.info("Audio track loaded successfully")
+        except Exception as e:
+            logger.warning(f"No audio track found: {e}")
+            self.audio_clip = None
 
         # Validate video file
         if not Path(video_path).exists():
@@ -121,22 +133,69 @@ class LivestreamProducer:
 
     def extract_audio_chunk(self) -> dict:
         """
-        Simulate audio extraction (placeholder)
-        In real implementation, use libraries like moviepy or ffmpeg
-
-        Returns:
-            Audio chunk data
+        Extract audio chunk corresponding to current time
         """
-        message = {
+        if self.audio_clip is None:
+            return self._empty_audio_msg()
+
+        try:
+            # Tính thời gian hiện tại dựa trên số frame
+            current_time = self.frame_count / VIDEO_FPS
+            duration = AUDIO_CHUNK_DURATION  # Ví dụ 1.0 giây
+
+            # Cắt audio (subclip)
+            # Lưu ý: Cần xử lý biên (nếu current_time + duration > tổng thời lượng)
+            end_time = min(current_time + duration, self.audio_clip.duration)
+            if current_time >= end_time:
+                return self._empty_audio_msg()
+
+            sub_clip = self.audio_clip.subclip(current_time, end_time)
+
+            # Ghi ra file tạm wav -> Đọc bytes -> Base64
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+                temp_filename = f.name
+
+            # write_audiofile của moviepy có thể in log, ta tắt verbose
+            sub_clip.write_audiofile(
+                temp_filename,
+                fps=16000,
+                nbytes=2,
+                codec="pcm_s16le",
+                verbose=False,
+                logger=None,
+            )
+
+            with open(temp_filename, "rb") as f:
+                audio_bytes = f.read()
+
+            os.remove(temp_filename)  # Dọn dẹp
+
+            # Encode Base64
+            audio_b64 = base64.b64encode(audio_bytes).decode("utf-8")
+
+            return {
+                "chunk_id": self.audio_chunk_count,
+                "timestamp": time.time(),
+                "data": audio_b64,  # Dữ liệu thật
+                "duration": duration,
+                "sample_rate": 16000,
+            }
+
+        except Exception as e:
+            logger.error(f"Error extracting audio: {e}")
+            return self._empty_audio_msg()
+
+    def _empty_audio_msg(self) -> dict:
+        """
+        Return empty audio message when no audio is available
+        """
+        return {
             "chunk_id": self.audio_chunk_count,
             "timestamp": time.time(),
-            "data": "",  # Placeholder for audio data
-            "duration": AUDIO_CHUNK_DURATION,
+            "data": "",  # Empty data
+            "duration": 0,
             "sample_rate": 16000,
         }
-
-        self.audio_chunk_count += 1
-        return message
 
     def send_frame(self, frame_data: dict):
         """

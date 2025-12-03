@@ -40,7 +40,7 @@ model = AutoModelForImageClassification.from_pretrained(model_dir)
 model.eval()
 
 # open video and grab a frame
-video_path = Path("data") / "V_10.mp4"
+video_path = Path("data") / "v001_converted.avi"
 cap = cv2.VideoCapture(str(video_path))
 if not cap.isOpened():
     raise RuntimeError("Failed to open video")

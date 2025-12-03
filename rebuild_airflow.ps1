@@ -3,6 +3,10 @@ Write-Host "[*] Rebuilding Airflow containers with dependencies..." -ForegroundC
 
 cd docker
 
+# Enable BuildKit for faster builds with cache
+$env:DOCKER_BUILDKIT=1
+$env:COMPOSE_DOCKER_CLI_BUILD=1
+
 # Stop existing containers
 Write-Host "[*] Stopping existing Airflow containers..." -ForegroundColor Yellow
 docker-compose stop airflow-webserver airflow-scheduler airflow-worker
@@ -11,8 +15,8 @@ docker-compose stop airflow-webserver airflow-scheduler airflow-worker
 Write-Host "[*] Removing old containers..." -ForegroundColor Yellow
 docker-compose rm -f airflow-webserver airflow-scheduler airflow-worker
 
-# Build new image with dependencies
-Write-Host "[*] Building custom Airflow image..." -ForegroundColor Cyan
+# Build new image with dependencies (BuildKit will use cache mount)
+Write-Host "[*] Building custom Airflow image with cache..." -ForegroundColor Cyan
 docker-compose build airflow-webserver
 
 # Start services

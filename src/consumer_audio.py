@@ -1,82 +1,117 @@
 """
-Audio Consumer: Process audio chunks and detect toxic speech using Whisper + NLP
+Audio Consumer: Process audio chunks to detect Toxic Speech (Whisper) and Screaming/Violence (AST)
 """
 
 import logging
 import argparse
 import time
+import json
+import base64
+import tempfile
+import os
+import numpy as np
+import librosa
+import soundfile as sf
+from typing import Dict, Any, Tuple
+
 from kafka import KafkaConsumer
 from kafka.errors import KafkaError
-import json
-from typing import Dict, Any
 
+# Configs imports
 from config import (
     KAFKA_BOOTSTRAP_SERVERS,
     KAFKA_TOPIC_AUDIO,
-    WHISPER_MODEL,
-    TOXIC_KEYWORDS,
     LOG_LEVEL,
 )
 from utils import (
-    check_toxic_content,
-    calculate_alert_level,
+    check_toxic_content,  # Hàm check text từ khóa (bạn đã có)
     MongoDBHandler,
     AlertThrottler,
 )
 
 # Configure logging
-logging.basicConfig(level=LOG_LEVEL)
+logging.basicConfig(
+    level=LOG_LEVEL, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
 logger = logging.getLogger(__name__)
 
-# Try to import Whisper
+# --- IMPORT MODELS ---
+# 1. Whisper (Speech to Text)
 try:
     import whisper
 
     WHISPER_AVAILABLE = True
 except ImportError:
-    logger.warning("Whisper not available. Install with: pip install openai-whisper")
+    logger.warning("❌ Whisper not found. 'Toxic Speech' detection disabled.")
     WHISPER_AVAILABLE = False
+
+# 2. Transformers (Sound Event Detection - Screaming/Yelling)
+try:
+    from transformers import ASTImageProcessor, ASTForAudioClassification
+    import torch
+
+    TRANSFORMERS_AVAILABLE = True
+except ImportError:
+    logger.warning("❌ Transformers not found. 'Screaming' detection disabled.")
+    TRANSFORMERS_AVAILABLE = False
 
 
 class AudioConsumer:
-    """Consumer for processing audio and detecting toxic speech"""
+    """Consumer for processing audio streams"""
 
     def __init__(self, kafka_servers: str = KAFKA_BOOTSTRAP_SERVERS):
-        """
-        Initialize audio consumer
-
-        Args:
-            kafka_servers: Kafka bootstrap servers
-        """
         self.kafka_servers = kafka_servers
-        self.consumer = None
-        self.model = None
         self.db_handler = MongoDBHandler()
-        self.alert_throttler = AlertThrottler(cooldown_seconds=5)
+        self.alert_throttler = AlertThrottler(cooldown_seconds=10)
         self.chunk_count = 0
 
-        logger.info("Initializing AudioConsumer")
+        # Audio Params
+        self.target_sample_rate = 16000  # Whisper & AST đều thích 16k
 
-        # Load Whisper model
-        self.load_model()
+        logger.info("Initializing AudioConsumer...")
+        self.load_models()
 
-    def load_model(self):
-        """Load Whisper model"""
-        if not WHISPER_AVAILABLE:
-            logger.error("Whisper not available, cannot load model")
-            return
+        # Danh sách các âm thanh nguy hiểm cần bắt (theo nhãn của AudioSet)
+        self.harmful_sound_labels = [
+            "Screaming",
+            "Yelling",
+            "Shouting",
+            "Crying, sobbing",
+            "Gunshot, gunfire",
+            "Explosion",
+            "Bang",
+        ]
 
-        try:
-            logger.info(f"Loading Whisper model: {WHISPER_MODEL}")
-            self.model = whisper.load_model(WHISPER_MODEL)
-            logger.info("Whisper model loaded successfully")
+    def load_models(self):
+        """Load AI Models"""
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        logger.info(f"Using Device: {self.device}")
 
-        except Exception as e:
-            logger.error(f"Failed to load Whisper model: {e}")
-            raise
+        # 1. Load Whisper
+        if WHISPER_AVAILABLE:
+            try:
+                # 'tiny' hoặc 'base' là đủ nhanh cho realtime. 'small' chính xác hơn nhưng chậm.
+                self.whisper_model = whisper.load_model("base", device=self.device)
+                logger.info("✅ Whisper Model Loaded")
+            except Exception as e:
+                logger.error(f"Error loading Whisper: {e}")
+                self.whisper_model = None
+
+        # 2. Load Audio Spectrogram Transformer (AST)
+        if TRANSFORMERS_AVAILABLE:
+            try:
+                model_name = "MIT/ast-finetuned-audioset-10-10-0.4593"
+                self.ast_processor = ASTImageProcessor.from_pretrained(model_name)
+                self.ast_model = ASTForAudioClassification.from_pretrained(
+                    model_name
+                ).to(self.device)
+                logger.info("✅ AST Model (Event Detection) Loaded")
+            except Exception as e:
+                logger.error(f"Error loading AST: {e}")
+                self.ast_model = None
 
     def connect_kafka(self):
-        """Connect to Kafka broker"""
+        """Connect to Kafka"""
         try:
             self.consumer = KafkaConsumer(
                 KAFKA_TOPIC_AUDIO,
@@ -85,190 +120,223 @@ class AudioConsumer:
                 enable_auto_commit=True,
                 group_id="audio-processing-group",
                 value_deserializer=lambda m: json.loads(m.decode("utf-8")),
-                max_poll_records=5,
-                session_timeout_ms=30000,
+                max_poll_records=5,  # Xử lý ít thôi vì Audio nặng
             )
-            logger.info(f"Connected to Kafka at {self.kafka_servers}")
-            logger.info(f"Subscribed to topic: {KAFKA_TOPIC_AUDIO}")
+            logger.info(f"Connected to Kafka topic: {KAFKA_TOPIC_AUDIO}")
         except KafkaError as e:
-            logger.error(f"Failed to connect to Kafka: {e}")
+            logger.error(f"Kafka connection failed: {e}")
             raise
 
-    def transcribe_audio(self, audio_data: str) -> str:
+    def decode_audio(self, base64_data: str) -> np.ndarray:
         """
-        Transcribe audio to text using Whisper
-
-        Args:
-            audio_data: Audio data (base64 or file path)
-
-        Returns:
-            Transcribed text
+        Decode base64 -> Save temp .wav -> Load via Librosa -> Return Numpy Array
         """
-        if not self.model or not WHISPER_AVAILABLE:
-            logger.warning("Whisper model not available, skipping transcription")
-            return ""
+        try:
+            audio_bytes = base64.b64decode(base64_data)
+
+            # Tạo file tạm để librosa đọc (librosa cần file path hoặc file-like object)
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_file:
+                temp_file.write(audio_bytes)
+                temp_path = temp_file.name
+
+            # Load audio & Resample về 16kHZ
+            audio_array, _ = librosa.load(temp_path, sr=self.target_sample_rate)
+
+            # Xóa file tạm
+            os.remove(temp_path)
+
+            return audio_array
+        except Exception as e:
+            logger.error(f"Audio decoding error: {e}")
+            return None
+
+    def detect_sound_events(self, audio_array: np.ndarray) -> Dict:
+        """
+        Detect non-speech events (Screaming, Explosions...) using AST
+        """
+        if not self.ast_model:
+            return {"is_harmful": False, "label": None, "score": 0.0}
 
         try:
-            # Note: In real implementation, decode audio_data and save to temp file
-            # For now, we'll simulate transcription
-            # result = self.model.transcribe(audio_file_path)
-            # return result["text"]
+            # AST model yêu cầu input độ dài cố định, ta padding hoặc cắt
+            # Đơn giản hóa: Chỉ lấy 1024 điểm đặc trưng đầu tiên (khoảng 10s)
+            inputs = self.ast_processor(
+                audio_array, sampling_rate=self.target_sample_rate, return_tensors="pt"
+            )
+            inputs = {k: v.to(self.device) for k, v in inputs.items()}
 
-            # Placeholder: return empty string
-            # In production, implement proper audio decoding and transcription
-            logger.debug("Audio transcription placeholder - implement audio decoding")
-            return ""
+            with torch.no_grad():
+                outputs = self.ast_model(**inputs)
+                logits = outputs.logits
+                probs = torch.softmax(logits, dim=-1)
+
+                # Lấy Top 1 sự kiện
+                score, idx = torch.max(probs, dim=-1)
+                predicted_label = self.ast_model.config.id2label[idx.item()]
+                score_val = score.item()
+
+            # Check xem có phải âm thanh nguy hiểm không
+            is_harmful = False
+            # Ngưỡng thấp (0.3) vì model này detect nhiều class, score thường bị chia nhỏ
+            if score_val > 0.3 and predicted_label in self.harmful_sound_labels:
+                is_harmful = True
+
+            return {
+                "is_harmful": is_harmful,
+                "label": predicted_label,
+                "score": score_val,
+            }
 
         except Exception as e:
-            logger.error(f"Transcription error: {e}")
-            return ""
+            logger.error(f"AST detection error: {e}")
+            return {"is_harmful": False, "label": None, "score": 0.0}
 
-    def process_audio(self, message: Dict[str, Any]):
+    def transcribe_and_check_toxic(self, audio_array: np.ndarray) -> Dict:
         """
-        Process an audio chunk message
+        Speech-to-text -> Check keywords
+        """
+        if not self.whisper_model:
+            return {"is_toxic": False, "text": "", "keywords": []}
 
-        Args:
-            message: Kafka message containing audio data
-        """
         try:
-            chunk_id = message.get("chunk_id", -1)
-            timestamp = message.get("timestamp", time.time())
-            audio_data = message.get("data", "")
+            # Whisper yêu cầu float32
+            audio_array = audio_array.astype(np.float32)
 
-            if not audio_data:
-                logger.debug(f"Empty audio data for chunk {chunk_id}")
-                return
+            # Transcribe
+            # Note: Whisper có thể xử lý trực tiếp numpy array
+            result = self.whisper_model.transcribe(
+                audio_array, fp16=False, language="vi"
+            )  # fp16=False để chạy trên CPU ok
+            text = result["text"].strip()
 
-            # Transcribe audio to text
-            transcribed_text = self.transcribe_audio(audio_data)
+            if not text:
+                return {"is_toxic": False, "text": "", "keywords": []}
 
-            if not transcribed_text:
-                logger.debug(f"No transcription for chunk {chunk_id}")
-                return
+            # Check toxic (Dùng hàm utils có sẵn)
+            # Giả định utils trả về: {'is_toxic': bool, 'matched_keywords': list, 'toxic_score': int}
+            from config import TOXIC_KEYWORDS  # Import ở đây để đảm bảo có data
 
-            logger.info(f"Transcribed text: {transcribed_text}")
+            toxic_result = check_toxic_content(text, TOXIC_KEYWORDS)
 
-            # Check for toxic content
-            toxic_result = check_toxic_content(transcribed_text, TOXIC_KEYWORDS)
+            return {
+                "is_toxic": toxic_result["is_toxic"],
+                "text": text,
+                "keywords": toxic_result.get("matched_keywords", []),
+                "score": toxic_result.get("toxic_score", 0),
+            }
 
-            # Save detection result to database
-            detection_record = {
+        except Exception as e:
+            logger.error(f"Whisper transcription error: {e}")
+            return {"is_toxic": False, "text": "", "keywords": []}
+
+    def process_message(self, message: Dict):
+        """Main processing loop for a chunk"""
+        chunk_id = message.get("chunk_id")
+        timestamp = message.get("timestamp")
+        b64_data = message.get("data")
+
+        if not b64_data:
+            return
+
+        # 1. Decode Audio
+        audio_array = self.decode_audio(b64_data)
+        if audio_array is None or len(audio_array) == 0:
+            return
+
+        # 2. Parallel Analysis (Tuần tự trong code này cho đơn giản)
+
+        # A. Detect Sound Events (Gào thét, nổ...)
+        sound_event = self.detect_sound_events(audio_array)
+
+        # B. Detect Toxic Speech (Chửi bậy...)
+        speech_result = self.transcribe_and_check_toxic(audio_array)
+
+        # 3. Logic Tổng hợp & Alert
+        is_alert = False
+        alert_type = "INFO"
+        alert_details = ""
+
+        # Check Âm thanh (Screaming)
+        if sound_event["is_harmful"]:
+            is_alert = True
+            alert_type = "SCREAMING/VIOLENCE"
+            alert_details = (
+                f"Detected sound: {sound_event['label']} ({sound_event['score']:.1%})"
+            )
+            logger.warning(f"🔊 ALERT: {alert_details}")
+
+            if self.alert_throttler.should_send_alert("audio_scream"):
+                self.db_handler.save_alert(
+                    {
+                        "source": "audio",
+                        "frame_id": chunk_id,  # Dùng chunk_id thay frame_id
+                        "detection_type": "Audio Event",
+                        "level": "HIGH",
+                        "confidence": sound_event["score"],
+                        "details": alert_details,
+                        "timestamp": timestamp,
+                    }
+                )
+
+        # Check Lời nói (Toxic)
+        if speech_result["is_toxic"]:
+            is_alert = True
+            alert_type = "TOXIC SPEECH"
+            alert_details = f"Toxic words: {speech_result['keywords']} in text: '{speech_result['text']}'"
+            logger.warning(f"🤬 ALERT: {alert_details}")
+
+            if self.alert_throttler.should_send_alert("audio_toxic"):
+                self.db_handler.save_alert(
+                    {
+                        "source": "audio",
+                        "frame_id": chunk_id,
+                        "detection_type": "Toxic Speech",
+                        "level": "MEDIUM",
+                        "confidence": 1.0,
+                        "details": alert_details,
+                        "timestamp": timestamp,
+                    }
+                )
+
+        # 4. Save Detection Record (Log lại mọi thứ)
+        self.db_handler.save_detection(
+            {
                 "chunk_id": chunk_id,
                 "timestamp": timestamp,
-                "transcribed_text": transcribed_text,
-                "is_toxic": toxic_result["is_toxic"],
-                "toxic_score": toxic_result["toxic_score"],
-                "matched_keywords": toxic_result["matched_keywords"],
+                "transcribed_text": speech_result["text"],
+                "sound_label": sound_event["label"],
+                "sound_confidence": sound_event["score"],
+                "is_toxic": speech_result["is_toxic"],
+                "is_screaming": sound_event["is_harmful"],
             }
+        )
 
-            self.db_handler.save_detection(detection_record)
-
-            # If toxic content detected, generate alert
-            if toxic_result["is_toxic"]:
-                self.generate_alert(chunk_id, transcribed_text, toxic_result)
-
-            self.chunk_count += 1
-
-            if self.chunk_count % 20 == 0:
-                logger.info(f"Processed {self.chunk_count} audio chunks")
-
-        except Exception as e:
-            logger.error(f"Error processing audio: {e}")
-
-    def generate_alert(self, chunk_id: int, text: str, toxic_result: Dict):
-        """
-        Generate alert for toxic speech
-
-        Args:
-            chunk_id: Audio chunk ID
-            text: Transcribed text
-            toxic_result: Toxic content detection result
-        """
-        try:
-            toxic_score = toxic_result["toxic_score"]
-            matched_keywords = toxic_result["matched_keywords"]
-
-            # Calculate alert level
-            alert_level = calculate_alert_level("toxic_speech", 0.8, toxic_score)
-
-            # Check if we should send alert (throttling)
-            alert_key = "audio_toxic_speech"
-
-            if not self.alert_throttler.should_send_alert(alert_key):
-                logger.debug("Alert throttled for toxic speech")
-                return
-
-            # Create alert
-            alert_data = {
-                "source": "audio",
-                "chunk_id": chunk_id,
-                "detection_type": "toxic_speech",
-                "confidence": min(toxic_score / 5.0, 1.0),  # Normalize to 0-1
-                "level": alert_level,
-                "transcribed_text": text,
-                "matched_keywords": matched_keywords,
-                "toxic_score": toxic_score,
-                "details": f"Detected {len(matched_keywords)} toxic keywords: {', '.join(matched_keywords)}",
-            }
-
-            # Save alert to database
-            self.db_handler.save_alert(alert_data)
-
-            logger.warning(
-                f"⚠️ ALERT [{alert_level}]: Toxic speech detected "
-                f"(score: {toxic_score}) in chunk {chunk_id}"
+        if self.chunk_count % 10 == 0:
+            logger.info(
+                f"Processed chunk {chunk_id}: {sound_event['label']} | Text: {speech_result['text'][:30]}..."
             )
-            logger.warning(f"   Matched keywords: {', '.join(matched_keywords)}")
-            logger.warning(f"   Text: {text[:100]}...")
 
-        except Exception as e:
-            logger.error(f"Error generating alert: {e}")
+        self.chunk_count += 1
 
     def run(self):
-        """Run the consumer"""
         try:
             self.connect_kafka()
+            logger.info("🎧 Audio Consumer listening...")
 
-            logger.info("Starting audio consumer...")
-            logger.info("Waiting for messages...")
-
-            for message in self.consumer:
-                self.process_audio(message.value)
+            for msg in self.consumer:
+                self.process_message(msg.value)
 
         except KeyboardInterrupt:
-            logger.info("Consumer stopped by user")
-        except Exception as e:
-            logger.error(f"Consumer error: {e}")
-            raise
+            logger.info("Stopped.")
         finally:
-            self.cleanup()
-
-    def cleanup(self):
-        """Cleanup resources"""
-        if self.consumer:
-            self.consumer.close()
-            logger.info("Kafka consumer closed")
-
-        if self.db_handler:
+            if self.consumer:
+                self.consumer.close()
             self.db_handler.close()
-            logger.info("Database connection closed")
-
-
-def main():
-    """Main entry point"""
-    parser = argparse.ArgumentParser(description="Audio Consumer")
-    parser.add_argument(
-        "--kafka",
-        type=str,
-        default=KAFKA_BOOTSTRAP_SERVERS,
-        help="Kafka bootstrap servers",
-    )
-
-    args = parser.parse_args()
-
-    consumer = AudioConsumer(args.kafka)
-    consumer.run()
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--kafka", type=str, default=KAFKA_BOOTSTRAP_SERVERS)
+    args = parser.parse_args()
+
+    AudioConsumer(args.kafka).run()
