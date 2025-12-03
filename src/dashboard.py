@@ -92,6 +92,8 @@ def get_start_time(time_range_str):
         return (now - timedelta(hours=24)).timestamp()
     elif time_range_str == "Last 7 days":
         return (now - timedelta(days=7)).timestamp()
+    elif time_range_str == "All Time":
+        return 0  # Show all data from beginning
     return (now - timedelta(hours=1)).timestamp()  # Default
 
 
@@ -139,7 +141,9 @@ def main():
     # Filters
     st.sidebar.subheader("Filters")
     time_range = st.sidebar.selectbox(
-        "Time Range", ["Last 1 hour", "Last 6 hours", "Last 24 hours", "Last 7 days"]
+        "Time Range",
+        ["Last 1 hour", "Last 6 hours", "Last 24 hours", "Last 7 days", "All Time"],
+        index=4,  # Default to "Last 24 hours"
     )
     selected_levels = st.sidebar.multiselect(
         "Alert Levels", ["HIGH", "MEDIUM", "LOW"], default=["HIGH", "MEDIUM", "LOW"]
@@ -159,7 +163,6 @@ def main():
     raw_detections = db.get_recent_detections(limit=1000)
     raw_alerts = db.get_recent_alerts(limit=500)
 
-    # Apply Filters (Time & Level)
     detections = [
         d
         for d in raw_detections
@@ -213,7 +216,7 @@ def main():
                         "LOW": "gold",
                     },
                 )
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, width="stretch")
             else:
                 st.info("No alerts in this period.")
 
@@ -228,7 +231,7 @@ def main():
                 fig = px.pie(
                     names=list(counts.keys()), values=list(counts.values()), hole=0.4
                 )
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, width="stretch")
             else:
                 st.info("No data available.")
 
@@ -248,7 +251,6 @@ def main():
     with tab3:
         st.subheader("📸 Harmful Content Gallery")
 
-        # Filter only detections that are harmful AND have image data
         harmful_frames = [d for d in detections if d.get("is_harmful") and "data" in d]
 
         if harmful_frames:
@@ -269,7 +271,7 @@ def main():
                             if img is not None:
                                 # OpenCV is BGR, Streamlit needs RGB/BGR specified
                                 # Use channels="BGR" to let Streamlit know format
-                                st.image(img, channels="BGR", use_container_width=True)
+                                st.image(img, channels="BGR", width="stretch")
                             else:
                                 st.error("Image decode failed")
                         except Exception:

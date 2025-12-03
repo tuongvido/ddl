@@ -123,7 +123,7 @@ MONGO_PORT = int(os.getenv("MONGO_PORT", 27017))
 MONGO_USERNAME = os.getenv("MONGO_USERNAME", "admin")
 MONGO_PASSWORD = os.getenv("MONGO_PASSWORD", "admin123")
 MONGO_DB = "livestream_detection"
-MONGO_COLLECTION_DETECTIONS = "detections"
+MONGO_COLLECTION_DETECTIONS = "video_detections"
 MONGO_COLLECTION_ALERTS = "alerts"
 
 # Alert Configuration

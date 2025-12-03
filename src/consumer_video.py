@@ -182,7 +182,7 @@ class VideoConsumer:
                 bootstrap_servers=self.kafka_servers,
                 auto_offset_reset="latest",
                 enable_auto_commit=True,
-                group_id="video-processing-group-v2",  # Đổi group ID để tránh conflict cũ
+                group_id="video-processing-group",
                 value_deserializer=lambda m: json.loads(m.decode("utf-8")),
                 max_poll_records=5,
             )
