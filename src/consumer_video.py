@@ -49,9 +49,9 @@ stream_handler.setFormatter(formatter)
 logger.addHandler(stream_handler)
 
 # B. Handler ghi ra file (Để bạn check file nếu Console bị trôi)
-file_handler = logging.FileHandler("video_consumer.log")
-file_handler.setFormatter(formatter)
-logger.addHandler(file_handler)
+# file_handler = logging.FileHandler("video_consumer.log")
+# file_handler.setFormatter(formatter)
+# logger.addHandler(file_handler)
 
 # --- Dependency Check ---
 try:
