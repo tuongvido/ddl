@@ -7,8 +7,10 @@ from pathlib import Path
 
 # Project paths
 BASE_DIR = Path(__file__).resolve().parent.parent
-DATA_DIR = BASE_DIR / "data"
 MODELS_DIR = BASE_DIR / "models"
+DATA_DIR = BASE_DIR / "data"
+SCAN_INTERVAL = 5  # seconds
+SUPPORTED_EXTS = {".mp4", ".avi", ".mkv"}
 
 # Kafka Configuration
 KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")

@@ -1,7 +1,3 @@
-"""
-Producer: Simulates livestream by reading video file and sending frames to Kafka
-"""
-
 import cv2
 import time
 import logging
@@ -27,25 +23,22 @@ from config import (
     VIDEO_SAMPLE_RATE,
     AUDIO_CHUNK_DURATION,
     LOG_LEVEL,
+    DATA_DIR,
+    SCAN_INTERVAL,
+    SUPPORTED_EXTS
 )
 from utils import encode_image_to_base64, MongoDBHandler
 
 # Configure logging
 logging.basicConfig(level=LOG_LEVEL)
 logger = logging.getLogger(__name__)
+db_handler = MongoDBHandler()
 
 
-class LivestreamProducer:
-    """Simulate livestream by reading video file and sending to Kafka"""
+class VideoProducer:
 
     def __init__(self, video_path: str, kafka_servers: str = KAFKA_BOOTSTRAP_SERVERS):
-        """
-        Initialize producer
 
-        Args:
-            video_path: Path to video file
-            kafka_servers: Kafka bootstrap servers
-        """
         self.video_path = video_path
         self.kafka_servers = kafka_servers
         self.producer = None
@@ -55,7 +48,6 @@ class LivestreamProducer:
         
         # Generate unique session ID for this video
         self.session_id = str(uuid.uuid4())
-        self.db_handler = MongoDBHandler()
 
         try:
             self.video_clip = VideoFileClip(video_path)
@@ -69,7 +61,7 @@ class LivestreamProducer:
         if not Path(video_path).exists():
             raise FileNotFoundError(f"Video file not found: {video_path}")
 
-        logger.info(f"Initializing LivestreamProducer with video: {video_path}")
+        logger.info(f"Initializing VideoProducer with video: {video_path}")
         logger.info(f"Session ID: {self.session_id}")
 
     def connect_kafka(self):
@@ -111,20 +103,8 @@ class LivestreamProducer:
             raise
 
     def process_frame(self, frame: np.ndarray) -> dict:
-        """
-        Process video frame
-
-        Args:
-            frame: OpenCV frame
-
-        Returns:
-            Processed frame data
-        """
-        # Resize frame to standard size
-        frame_resized = cv2.resize(frame, (VIDEO_FRAME_WIDTH, VIDEO_FRAME_HEIGHT))
-
         # Encode to base64
-        frame_encoded = encode_image_to_base64(frame_resized)
+        frame_encoded = encode_image_to_base64(frame)
 
         # Create message
         message = {
@@ -206,12 +186,6 @@ class LivestreamProducer:
         }
 
     def send_frame(self, frame_data: dict):
-        """
-        Send frame to Kafka
-
-        Args:
-            frame_data: Frame data dictionary
-        """
         try:
             self.producer.send(KAFKA_TOPIC_VIDEO, value=frame_data)
             # Wait for confirmation (optional, can be removed for higher throughput)
@@ -235,13 +209,7 @@ class LivestreamProducer:
         except Exception as e:
             logger.error(f"Failed to send audio: {e}")
 
-    def run(self, loop: bool = False):
-        """
-        Run the producer
-
-        Args:
-            loop: If True, loop video when it ends
-        """
+    def run(self):
         try:
             self.connect_kafka()
             self.open_video()
@@ -258,7 +226,7 @@ class LivestreamProducer:
                 "total_frames": total_frames,
                 "duration_seconds": duration,
             }
-            self.db_handler.create_video_session(self.session_id, video_info)
+            db_handler.create_video_session(self.session_id, video_info)
 
             logger.info("Starting livestream simulation...")
             logger.info(
@@ -271,17 +239,11 @@ class LivestreamProducer:
                 ret, frame = self.video_capture.read()
 
                 if not ret:
-                    if loop:
-                        logger.info("Video ended, restarting from beginning...")
-                        self.video_capture.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                        self.frame_count = 0
-                        continue
-                    else:
-                        logger.info("Video ended, finalizing session...")
-                        # Finalize session and get summary
-                        summary = self.db_handler.finalize_video_session(self.session_id)
-                        logger.info(f"📊 Final Summary: {summary.get('toxic_summary', 'No summary')}")
-                        break
+                    logger.info("Video ended, finalizing session...")
+                    # Finalize session and get summary
+                    summary = db_handler.finalize_video_session(self.session_id)
+                    logger.info(f"📊 Final Summary: {summary.get('toxic_summary', 'No summary')}")
+                    break
 
                 # Process and send frame
                 frame_data = self.process_frame(frame)
@@ -306,7 +268,7 @@ class LivestreamProducer:
         except KeyboardInterrupt:
             logger.info("Producer stopped by user")
             # Finalize session on interrupt
-            summary = self.db_handler.finalize_video_session(self.session_id)
+            summary = db_handler.finalize_video_session(self.session_id)
             logger.info(f"📊 Session Summary: {summary.get('toxic_summary', 'No summary')}")
         except Exception as e:
             logger.error(f"Producer error: {e}")
@@ -327,21 +289,60 @@ class LivestreamProducer:
 
 
 def main():
-    """Main entry point"""
-    parser = argparse.ArgumentParser(description="Livestream Producer")
-    parser.add_argument("--video", type=str, required=True, help="Path to video file")
+    parser = argparse.ArgumentParser(description="“Detection of harmful content")
     parser.add_argument(
         "--kafka",
         type=str,
         default=KAFKA_BOOTSTRAP_SERVERS,
         help="Kafka bootstrap servers",
     )
-    parser.add_argument("--loop", action="store_true", help="Loop video when it ends")
 
     args = parser.parse_args()
 
-    producer = LivestreamProducer(args.video, args.kafka)
-    producer.run(loop=args.loop)
+    processed_videos = set()
+
+    while True:
+        logger.info(f"📂 Watching folder: {DATA_DIR.resolve()}")
+        try:
+            video_files = sorted(
+                [
+                    f for f in DATA_DIR.iterdir()
+                    if f.suffix.lower() in SUPPORTED_EXTS
+                ]
+            )
+
+            for video_path in video_files:
+                video_path_str = str(video_path.resolve())
+
+                if video_path_str in processed_videos:
+                    continue
+
+                # 👉 Skip nếu video đã từng xử lý
+                if db_handler.video_exists(video_path_str):
+                    logger.info(f"⏭ Skip processed video: {video_path.name}")
+                    processed_videos.add(video_path_str)
+                    continue
+
+                logger.info(f"🎬 New video detected: {video_path.name}")
+
+                try:
+                    producer = VideoProducer(
+                        video_path=str(video_path),
+                        kafka_servers=args.kafka,
+                    )
+                    producer.run()
+
+                    processed_videos.add(video_path.name)
+                    logger.info(f"✅ Finished processing: {video_path.name}")
+
+                except Exception as e:
+                    logger.error(f"❌ Failed processing {video_path.name}: {e}")
+
+            time.sleep(SCAN_INTERVAL)
+
+        except KeyboardInterrupt:
+            logger.info("🛑 Folder watcher stopped by user")
+            break
 
 
 if __name__ == "__main__":

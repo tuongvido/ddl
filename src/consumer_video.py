@@ -409,37 +409,37 @@ class VideoConsumer:
             result = self.check_harmful_content(detections, text_result)
             # logger.info(f"result: {result}")
 
-            if result["is_harmful"]:
-                # Determine detection type
-                detection_types = []
-                if len(detections) > 0:
-                    detection_types.append("violent_video")
-                if text_result.get("is_toxic", False):
-                    detection_types.append("toxic_text_on_screen")
-                # Save DB
-                # logger.info(f"detections: {detections}")
-                detection_record = {
-                    "frame_id": frame_id,
-                    "timestamp": timestamp,
-                    "detections": result["harmful_detections"],
-                    "text_detection": text_result,
-                    "is_harmful": True,
-                    "data": frame_data,
-                    "session_id": session_id,
-                    "detection_type": ", ".join(detection_types) if len(detection_types) > 1 else detection_types[0] if detection_types else "violent_video",
-                }
-                # logger.info(f"result: {detection_record}")
-                self.db_handler.save_detection(detection_record)
-                
-                # Update video session summary for each type
-                for det_type in detection_types:
-                    session_record = detection_record.copy()
-                    session_record["detection_type"] = det_type
-                    self.db_handler.update_video_session(session_id, session_record)
-                
-                self.db_handler.finalize_video_session(session_id)
-                # Alert
-                self.generate_alert(frame_id, result, frame)
+            # if result["is_harmful"]:
+            # Determine detection type
+            detection_types = []
+            if len(detections) > 0:
+                detection_types.append("violent_video")
+            if text_result.get("is_toxic", False):
+                detection_types.append("toxic_text_on_screen")
+            # Save DB
+            # logger.info(f"detections: {detections}")
+            detection_record = {
+                "frame_id": frame_id,
+                "timestamp": timestamp,
+                "detections": result["harmful_detections"],
+                "text_detection": text_result,
+                "is_harmful": True,
+                "data": frame_data,
+                "session_id": session_id,
+                "detection_type": ", ".join(detection_types) if len(detection_types) > 1 else detection_types[0] if detection_types else "violent_video",
+            }
+            # logger.info(f"result: {detection_record}")
+            self.db_handler.save_detection(detection_record)
+            
+            # Update video session summary for each type
+            for det_type in detection_types:
+                session_record = detection_record.copy()
+                session_record["detection_type"] = det_type
+                self.db_handler.update_video_session(session_id, session_record)
+            
+            self.db_handler.finalize_video_session(session_id)
+            # Alert
+            self.generate_alert(session_id, frame_id, result, frame)
 
             if self.frame_count % 100 == 0:
                 logger.info(f"Processed {self.frame_count} frames...")
@@ -447,7 +447,7 @@ class VideoConsumer:
         except Exception as e:
             logger.error(f"Frame Processing Error: {e}")
 
-    def generate_alert(self, frame_id: int, harmful_result: Dict, frame):
+    def generate_alert(self, session_id, frame_id: int, harmful_result: Dict, frame):
         try:
             # Video action alerts
             for det in harmful_result["harmful_detections"]:
@@ -458,6 +458,7 @@ class VideoConsumer:
                 if self.alert_throttler.should_send_alert(alert_key):
                     level = calculate_alert_level(det_type, conf)
                     alert_data = {
+                        "session_id": session_id,
                         "source": "video",
                         "frame_id": frame_id,
                         "detection_type": det_type,
@@ -475,6 +476,7 @@ class VideoConsumer:
                 alert_key = "video_toxic_text"
                 if self.alert_throttler.should_send_alert(alert_key):
                     alert_data = {
+                        "session_id": session_id,
                         "source": "video",
                         "frame_id": frame_id,
                         "detection_type": "Toxic Text on Screen",

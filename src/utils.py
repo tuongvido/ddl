@@ -71,6 +71,12 @@ class MongoDBHandler:
             logger.error(f"Failed to connect to MongoDB: {e}")
             raise
 
+    def video_exists(self, video_path: str) -> bool:
+        return (
+            self.db[MONGO_COLLECTION_VIDEO_SUMMARY]
+            .find_one({"video_info.video_path": video_path}) is not None
+        )
+
     def save_detection(self, detection_data: Dict[str, Any]):
         """Save detection result to database"""
         try:
@@ -129,6 +135,12 @@ class MongoDBHandler:
         except Exception as e:
             logger.error(f"Failed to get alerts: {e}")
             return []
+        
+    def get_detections_by_session(self, session_id) -> List[Dict]:
+        return list(self.db[MONGO_COLLECTION_DETECTIONS].find({"session_id": session_id}))
+
+    def get_alerts_by_session(self, session_id) -> List[Dict]:
+        return list(self.db[MONGO_COLLECTION_ALERTS].find({"session_id": session_id}))
 
     def create_video_session(self, session_id: str, video_info: Dict) -> Any:
         """Create a new video session for tracking"""
@@ -431,12 +443,16 @@ class MongoDBHandler:
             logger.info("MongoDB connection closed")
 
 
-def encode_image_to_base64(frame: np.ndarray) -> str:
-    """Encode OpenCV frame to base64 string"""
+def encode_image_to_base64(frame: np.ndarray, quality: int = 75) -> str:
     try:
-        _, buffer = cv2.imencode(".jpg", frame)
-        jpg_as_text = base64.b64encode(buffer).decode("utf-8")
-        return jpg_as_text
+        encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), quality]
+        success, buffer = cv2.imencode(".jpg", frame, encode_param)
+
+        if not success:
+            raise ValueError("cv2.imencode failed")
+
+        return base64.b64encode(buffer).decode("utf-8")
+
     except Exception as e:
         logger.error(f"Failed to encode image: {e}")
         return ""
