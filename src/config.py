@@ -36,7 +36,7 @@ USE_VIOLENCE_CLASSIFIER = True
 # Softmax probability threshold for the 'violence' class (0..1)
 # Lower threshold = more sensitive detection (more false positives)
 # Higher threshold = less sensitive detection (may miss some violence)
-VIOLENCE_CLASSIFIER_THRESHOLD = 0.3  # Lowered to 0.3 for more sensitive detection
+VIOLENCE_CLASSIFIER_THRESHOLD = 0.2  # Lowered to 0.2 for boxing/fighting detection
 # How many frames to skip between classifier inferences (1 = every frame)
 VIOLENCE_CLASSIFIER_FRAME_SKIP = 1  # Changed from 3 to process more frames
 # Batch size for classifier inference (if using batched evaluation)
@@ -125,6 +125,7 @@ MONGO_PASSWORD = os.getenv("MONGO_PASSWORD", "admin123")
 MONGO_DB = "livestream_detection"
 MONGO_COLLECTION_DETECTIONS = "video_detections"
 MONGO_COLLECTION_ALERTS = "alerts"
+MONGO_COLLECTION_VIDEO_SUMMARY = "video_summary"
 
 # Alert Configuration
 ALERT_COOLDOWN = 5  # seconds between alerts for same type

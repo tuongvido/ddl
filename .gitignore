@@ -54,6 +54,9 @@ models/*.pt
 models/*.pth
 models/*.h5
 models/*.onnx
+models/*.safetensors
+models/phobert/
+models/*/
 !models/.gitkeep
 
 # Logs
@@ -96,3 +99,6 @@ kafka-logs/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Archive files
+*.zip

@@ -3,17 +3,23 @@ opencv-python>=4.8.0
 kafka-python>=2.0.2
 pymongo>=4.5.0
 ultralytics>=8.0.0
-openai-whisper>=20230314
 torch>=2.0.0
 torchvision>=0.15.0
 numpy<2.0.0
 pandas>=2.0.0
 scikit-learn>=1.3.0
 
-# CLIP model for violence detection
-git+https://github.com/openai/CLIP.git
+# Transformers for PhoWhisper and PhoBERT
+transformers>=4.30.0
 Pillow>=8.3.0
 PyYAML>=6.0.0
+
+# X3D video action recognition (fallback via torch.hub)
+pytorchvideo>=0.1.5
+
+# YAMNet for audio sound event detection
+tensorflow>=2.10.0
+tensorflow-hub>=0.12.0
 
 # Dashboard
 streamlit>=1.28.0
@@ -23,11 +29,17 @@ plotly>=5.17.0
 python-dotenv>=1.0.0
 pydantic>=2.0.0
 requests>=2.31.0
-librosa 
-soundfile 
-transformers 
+librosa
+soundfile
 torchaudio
 opencv-python-headless
 pymongo
 moviepy
-faster-whisper
+
+# Vietnamese models
+sentencepiece  # Required for PhoWhisper tokenization
+accelerate  # Required for faster model loading
+tf-keras  # Keras compatibility for TensorFlow models
+
+# OCR for text detection
+easyocr>=1.7.0  # Vietnamese and English OCR

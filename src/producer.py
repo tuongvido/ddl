@@ -15,6 +15,7 @@ from moviepy import VideoFileClip
 import base64
 import tempfile
 import os
+import uuid
 
 from config import (
     KAFKA_BOOTSTRAP_SERVERS,
@@ -27,7 +28,7 @@ from config import (
     AUDIO_CHUNK_DURATION,
     LOG_LEVEL,
 )
-from utils import encode_image_to_base64
+from utils import encode_image_to_base64, MongoDBHandler
 
 # Configure logging
 logging.basicConfig(level=LOG_LEVEL)
@@ -51,6 +52,10 @@ class LivestreamProducer:
         self.video_capture = None
         self.frame_count = 0
         self.audio_chunk_count = 0
+        
+        # Generate unique session ID for this video
+        self.session_id = str(uuid.uuid4())
+        self.db_handler = MongoDBHandler()
 
         try:
             self.video_clip = VideoFileClip(video_path)
@@ -65,6 +70,7 @@ class LivestreamProducer:
             raise FileNotFoundError(f"Video file not found: {video_path}")
 
         logger.info(f"Initializing LivestreamProducer with video: {video_path}")
+        logger.info(f"Session ID: {self.session_id}")
 
     def connect_kafka(self):
         """Connect to Kafka broker"""
@@ -127,6 +133,7 @@ class LivestreamProducer:
             "data": frame_encoded,
             "width": VIDEO_FRAME_WIDTH,
             "height": VIDEO_FRAME_HEIGHT,
+            "session_id": self.session_id,  # Add session ID to each frame
         }
 
         return message
@@ -178,6 +185,7 @@ class LivestreamProducer:
                 "data": audio_b64,  # Dữ liệu thật
                 "duration": duration,
                 "sample_rate": 16000,
+                "session_id": self.session_id,  # Add session ID to audio
             }
 
         except Exception as e:
@@ -194,6 +202,7 @@ class LivestreamProducer:
             "data": "",  # Empty data
             "duration": 0,
             "sample_rate": 16000,
+            "session_id": self.session_id,
         }
 
     def send_frame(self, frame_data: dict):
@@ -236,6 +245,20 @@ class LivestreamProducer:
         try:
             self.connect_kafka()
             self.open_video()
+            
+            # Get video info
+            fps = self.video_capture.get(cv2.CAP_PROP_FPS)
+            total_frames = int(self.video_capture.get(cv2.CAP_PROP_FRAME_COUNT))
+            duration = total_frames / fps if fps > 0 else 0
+            
+            # Create video session in database
+            video_info = {
+                "video_path": str(self.video_path),
+                "fps": fps,
+                "total_frames": total_frames,
+                "duration_seconds": duration,
+            }
+            self.db_handler.create_video_session(self.session_id, video_info)
 
             logger.info("Starting livestream simulation...")
             logger.info(
@@ -254,7 +277,10 @@ class LivestreamProducer:
                         self.frame_count = 0
                         continue
                     else:
-                        logger.info("Video ended, stopping producer")
+                        logger.info("Video ended, finalizing session...")
+                        # Finalize session and get summary
+                        summary = self.db_handler.finalize_video_session(self.session_id)
+                        logger.info(f"📊 Final Summary: {summary.get('toxic_summary', 'No summary')}")
                         break
 
                 # Process and send frame
@@ -279,6 +305,9 @@ class LivestreamProducer:
 
         except KeyboardInterrupt:
             logger.info("Producer stopped by user")
+            # Finalize session on interrupt
+            summary = self.db_handler.finalize_video_session(self.session_id)
+            logger.info(f"📊 Session Summary: {summary.get('toxic_summary', 'No summary')}")
         except Exception as e:
             logger.error(f"Producer error: {e}")
             raise

@@ -9,6 +9,7 @@ import plotly.express as px
 from datetime import datetime, timedelta
 import time
 from utils import MongoDBHandler, decode_base64_to_image
+from config import MONGO_COLLECTION_VIDEO_SUMMARY
 
 # --- 1. CONFIGURATION ---
 st.set_page_config(
@@ -128,7 +129,7 @@ def convert_to_timestamp(ts):
 
 
 def main():
-    st.title("🚨 Livestream Security Monitor")
+    st.title("🚨 Tiktok ")
     st.markdown("Real-time AI analysis for harmful content detection")
 
     # --- SIDEBAR: SETTINGS ---
@@ -177,8 +178,8 @@ def main():
     ]
 
     # --- TABS LAYOUT ---
-    tab1, tab2, tab3, tab4 = st.tabs(
-        ["📊 Overview", "🚨 Alerts Log", "📹 Video Evidence", "🎤 Audio Analysis"]
+    tab1, tab2, tab3, tab4, tab5 = st.tabs(
+        ["📊 Overview", "🚨 Alerts Log", "📹 Video Evidence", "🎤 Audio Analysis", "📋 Video Reports"]
     )
 
     # === TAB 1: OVERVIEW ===
@@ -186,7 +187,7 @@ def main():
         # Top Metrics
         col1, col2, col3, col4 = st.columns(4)
 
-        harmful_count = len([d for d in detections if d.get("is_harmful")])
+        harmful_count = len(detections)
         high_priority = len([a for a in alerts if a.get("type") == "HIGH"])
 
         col1.metric("Total Frames Analyzed", len(detections))
@@ -357,6 +358,183 @@ def main():
 
         else:
             st.info("No audio analysis data found in the selected period.")
+
+    # === TAB 5: VIDEO REPORTS ===
+    with tab5:
+        st.subheader("📋 Video Analysis Reports")
+        
+        try:
+            # Fetch all video sessions
+            video_sessions = list(db.db[MONGO_COLLECTION_VIDEO_SUMMARY].find().sort("start_time", -1).limit(50))
+            
+            if not video_sessions:
+                st.info("No video analysis reports found. Reports will appear here after processing videos.")
+            else:
+                st.success(f"Found {len(video_sessions)} video analysis sessions")
+                
+                # Display summary statistics
+                col1, col2, col3 = st.columns(3)
+                
+                total_videos = len(video_sessions)
+                toxic_videos = len([s for s in video_sessions if s.get("is_toxic", False)])
+                clean_videos = total_videos - toxic_videos
+                
+                col1.metric("Total Videos Analyzed", total_videos)
+                col2.metric("Toxic Videos", toxic_videos, delta_color="inverse")
+                col3.metric("Clean Videos", clean_videos, delta_color="normal")
+                
+                st.divider()
+                
+                # Filters for reports
+                st.markdown("### Filter Reports")
+                filter_col1, filter_col2 = st.columns(2)
+                
+                with filter_col1:
+                    toxicity_filter = st.selectbox(
+                        "Toxicity Status",
+                        ["All", "Toxic Only", "Clean Only"],
+                        index=0
+                    )
+                
+                with filter_col2:
+                    sort_by = st.selectbox(
+                        "Sort By",
+                        ["Most Recent", "Oldest First", "Most Toxic", "Longest Duration"],
+                        index=0
+                    )
+                
+                # Apply filters
+                filtered_sessions = video_sessions.copy()
+                
+                if toxicity_filter == "Toxic Only":
+                    filtered_sessions = [s for s in filtered_sessions if s.get("is_toxic", False)]
+                elif toxicity_filter == "Clean Only":
+                    filtered_sessions = [s for s in filtered_sessions if not s.get("is_toxic", False)]
+                
+                # Apply sorting
+                if sort_by == "Oldest First":
+                    filtered_sessions.reverse()
+                elif sort_by == "Most Toxic":
+                    filtered_sessions.sort(
+                        key=lambda x: sum(x.get("detection_counts", {}).values()),
+                        reverse=True
+                    )
+                elif sort_by == "Longest Duration":
+                    filtered_sessions.sort(
+                        key=lambda x: x.get("video_info", {}).get("duration_seconds", 0),
+                        reverse=True
+                    )
+                
+                st.divider()
+                
+                # Display each video report
+                for session in filtered_sessions:
+                    summary = session.get("summary")
+                    
+                    # Handle None summary - use session data directly
+                    if summary is None:
+                        summary = {}
+                    
+                    video_info = summary.get("video_info", session.get("video_info", {}))
+                    is_toxic = session.get("is_toxic", False)
+                    
+                    # Card container
+                    with st.container(border=True):
+                        # Header
+                        status_emoji = "⚠️" if is_toxic else "✅"
+                        status_text = "TOXIC CONTENT DETECTED" if is_toxic else "CLEAN"
+                        status_color = "#ffebee" if is_toxic else "#e8f5e9"
+                        
+                        st.markdown(
+                            f"""
+                            <div style="background-color: {status_color}; padding: 15px; border-radius: 8px; margin-bottom: 10px;">
+                                <h3 style="margin:0;">{status_emoji} {video_info.get('video_name', 'Unknown Video')}</h3>
+                                <p style="margin:5px 0 0 0; color: #666;">Session ID: {session.get('session_id', 'N/A')}</p>
+                            </div>
+                            """,
+                            unsafe_allow_html=True
+                        )
+                        
+                        # Video Info
+                        info_col1, info_col2, info_col3 = st.columns(3)
+                        with info_col1:
+                            st.metric("Duration", f"{video_info.get('duration_seconds', 0):.1f}s")
+                        with info_col2:
+                            st.metric("Total Frames", video_info.get('total_frames', 0))
+                        with info_col3:
+                            st.metric("FPS", f"{video_info.get('fps', 0):.1f}")
+                        
+                        # Detection Statistics
+                        if is_toxic:
+                            st.markdown("#### Detection Summary")
+                            det_stats = summary.get("detection_statistics", {})
+                            toxic_cats = session.get("toxic_categories", [])
+                            
+                            stats_col1, stats_col2, stats_col3 = st.columns(3)
+                            
+                            with stats_col1:
+                                if "violent_video" in toxic_cats:
+                                    st.error(f"🎬 Violent Video: {det_stats.get('violent_video_count', 0)} times")
+                            
+                            with stats_col2:
+                                if "violent_audio" in toxic_cats:
+                                    st.error(f"🔊 Violent Audio: {det_stats.get('violent_audio_count', 0)} times")
+                            
+                            with stats_col3:
+                                if "toxic_speech" in toxic_cats:
+                                    st.error(f"💬 Toxic Speech: {det_stats.get('toxic_speech_count', 0)} times")
+                            
+                            # Detected Labels
+                            detected_labels = summary.get("detected_labels", {})
+                            
+                            label_col1, label_col2 = st.columns(2)
+                            
+                            with label_col1:
+                                video_actions = detected_labels.get("video_actions", [])
+                                if video_actions:
+                                    st.markdown("**🎬 Violent Video Actions:**")
+                                    for item in video_actions[:5]:  # Top 5
+                                        st.markdown(f"- {item['label']}: **{item['count']}** times")
+                            
+                            with label_col2:
+                                audio_events = detected_labels.get("audio_events", [])
+                                if audio_events:
+                                    st.markdown("**🔊 Violent Audio Events:**")
+                                    for item in audio_events[:5]:  # Top 5
+                                        st.markdown(f"- {item['label']}: **{item['count']}** times")
+                            
+                            # Toxic Speech Samples
+                            toxic_samples = summary.get("toxic_speech_samples", [])
+                            if toxic_samples:
+                                with st.expander(f"💬 Toxic Speech Samples ({len(toxic_samples)} found)"):
+                                    for i, sample in enumerate(toxic_samples[:5], 1):
+                                        ts = datetime.fromtimestamp(sample['timestamp']).strftime("%H:%M:%S")
+                                        st.markdown(
+                                            f"""
+                                            **{i}. [{ts}]** (Confidence: {sample['confidence']:.1%})  
+                                            > "{sample['text']}"
+                                            """
+                                        )
+                        else:
+                            st.success("✅ No toxic content detected in this video")
+                        
+                        # Analysis Time
+                        analysis_time = summary.get("analysis_time", {})
+                        if analysis_time:
+                            st.caption(
+                                f"Analyzed: {analysis_time.get('start_time', 'N/A')} → {analysis_time.get('end_time', 'N/A')} "
+                                f"(Processing: {analysis_time.get('processing_duration_seconds', 0):.1f}s)"
+                            )
+                        
+                        # Full Report Button
+                        if summary.get("report_text"):
+                            with st.expander("📄 View Full Text Report"):
+                                st.code(summary["report_text"], language=None)
+        
+        except Exception as e:
+            st.error(f"Error loading video reports: {e}")
+            import traceback
+            st.code(traceback.format_exc())
 
     # --- FOOTER & REFRESH ---
     st.markdown("---")

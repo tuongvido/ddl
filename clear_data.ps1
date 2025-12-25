@@ -3,7 +3,7 @@ Write-Host "[*] Clearing all cached data..." -ForegroundColor Cyan
 
 # 1. Clear MongoDB collections
 Write-Host "`n[*] Clearing MongoDB data..." -ForegroundColor Yellow
-docker exec mongodb mongosh -u admin -p admin123 --authenticationDatabase admin livestream_detection --eval "db.video_detections.drop({}); db.audio_detections.drop({}); db.alerts.drop({}); print('MongoDB collections cleared successfully');"
+docker exec mongodb mongosh -u admin -p admin123 --authenticationDatabase admin livestream_detection --eval "db.video_detections.drop(); db.alerts.drop(); db.video_summary.drop(); print('MongoDB collections cleared successfully');"
 
 # 2. Delete and recreate Kafka topics
 Write-Host "`n[*] Resetting Kafka topics..." -ForegroundColor Yellow

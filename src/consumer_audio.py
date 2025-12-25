@@ -36,26 +36,37 @@ logger = logging.getLogger(__name__)
 
 # --- IMPORT MODELS ---
 
-# 1. Torch & AST (Sound Event Detection)
+# 1. YAMNet (Sound Event Detection - Lightweight)
 try:
-    import torch
-    from transformers import AutoFeatureExtractor, ASTForAudioClassification
+    import tensorflow as tf
+    import tensorflow_hub as hub
+    import numpy as np
 
-    TRANSFORMERS_AVAILABLE = True
+    YAMNET_AVAILABLE = True
 except ImportError as e:
-    logger.warning(f"❌ Transformers/Torch import failed: {e}")
-    TRANSFORMERS_AVAILABLE = False
+    logger.warning(f"❌ TensorFlow/YAMNet import failed: {e}")
+    YAMNET_AVAILABLE = False
 
-# 2. Faster Whisper (Optimized Speech to Text)
+# 2. PhoWhisper (Vietnamese Speech Recognition)
 try:
-    from faster_whisper import WhisperModel
-
-    WHISPER_AVAILABLE = True
+    from transformers import pipeline
+    PHOWHISPER_AVAILABLE = True
 except ImportError as e:
     logger.warning(
-        f"❌ Faster-Whisper not found. Install: pip install faster-whisper. Error: {e}"
+        f"❌ Transformers not found. Install: pip install transformers. Error: {e}"
     )
-    WHISPER_AVAILABLE = False
+    PHOWHISPER_AVAILABLE = False
+
+# 3. PhoBERT (Vietnamese Toxic Content Classification)
+try:
+    from transformers import AutoTokenizer, AutoModelForSequenceClassification
+    import torch
+    PHOBERT_AVAILABLE = True
+except ImportError as e:
+    logger.warning(
+        f"❌ PhoBERT dependencies not found. Error: {e}"
+    )
+    PHOBERT_AVAILABLE = False
 
 
 class AudioConsumer:
@@ -78,6 +89,14 @@ class AudioConsumer:
         # Buffer khởi tạo rỗng
         self.audio_buffer = np.array([], dtype=np.float32)
 
+        # Initialize model attributes to None
+        self.yamnet_model = None
+        self.yamnet_classes = []
+        self.phowhisper_model = None
+        self.phobert_tokenizer = None
+        self.phobert_model = None
+        self.device = None
+
         logger.info("Initializing AudioConsumer (Optimized)...")
         self.load_models()
 
@@ -94,44 +113,97 @@ class AudioConsumer:
         ]
 
     def load_models(self):
-        """Load AI Models (Optimized for Laptop/Demo)"""
+        """Load AI Models (YAMNet for Sound Events + Faster-Whisper for Speech)"""
 
-        # Setup Device
-        if torch.cuda.is_available():
-            self.device = "cuda"
-            self.compute_type = "float16"  # Hoặc "int8_float16" nếu GPU yếu
+        # YAMNet uses TensorFlow (CPU-friendly)
+        logger.info("Loading AI Models...")
+
+        # 1. Load YAMNet (Google's lightweight sound event detection model)
+        if YAMNET_AVAILABLE:
+            try:
+                logger.info("⏳ Loading YAMNet model...")
+                # YAMNet from TensorFlow Hub - efficient sound classification
+                yamnet_model_url = "https://tfhub.dev/google/yamnet/1"
+                self.yamnet_model = hub.load(yamnet_model_url)
+                
+                # Load YAMNet class names
+                yamnet_classes_url = "https://raw.githubusercontent.com/tensorflow/models/master/research/audio_set/yamnet/yamnet_class_map.csv"
+                try:
+                    import urllib.request
+                    import csv
+                    from io import StringIO
+                    
+                    with urllib.request.urlopen(yamnet_classes_url) as response:
+                        csv_content = response.read().decode('utf-8')
+                        self.yamnet_classes = []
+                        reader = csv.DictReader(StringIO(csv_content))
+                        for row in reader:
+                            self.yamnet_classes.append(row['display_name'])
+                except Exception as e:
+                    logger.warning(f"Could not load YAMNet classes from URL: {e}. Using default classes.")
+                    # Fallback to common harmful sound event classes
+                    self.yamnet_classes = ["Speech", "Gunshot", "Explosion", "Screaming", "Yelling"]
+                
+                logger.info(f"✅ YAMNet Loaded (Total classes: {len(self.yamnet_classes)})")
+            except Exception as e:
+                logger.error(f"❌ Error loading YAMNet: {e}")
+                import traceback
+                logger.error(traceback.format_exc())
+                self.yamnet_model = None
+                self.yamnet_classes = []
         else:
-            self.device = "cpu"
-            self.compute_type = "int8"  # CPU chạy int8 cực nhanh
+            logger.warning("⚠️ YAMNet not available - sound event detection disabled")
+            self.yamnet_model = None
+            self.yamnet_classes = []
 
-        logger.info(f"Using Device: {self.device} | Compute Type: {self.compute_type}")
-
-        # 1. Load Faster-Whisper (Thay cho Whisper gốc)
-        if WHISPER_AVAILABLE:
+        # 2. Load PhoWhisper (Vietnamese Speech Recognition)
+        if PHOWHISPER_AVAILABLE:
             try:
-                # Model 'small' là cân bằng nhất cho tiếng Việt trên máy cá nhân
-                # 'tiny' quá tệ, 'base' tạm được, 'small' khá tốt.
-                logger.info("⏳ Loading Faster-Whisper 'small' model...")
-                self.whisper_model = WhisperModel(
-                    "small", device=self.device, compute_type=self.compute_type
+                logger.info("⏳ Loading PhoWhisper model...")
+                # Use vinai/PhoWhisper for Vietnamese speech recognition
+                # Force PyTorch backend to avoid TensorFlow/Keras compatibility issues
+                self.phowhisper_model = pipeline(
+                    "automatic-speech-recognition",
+                    model="vinai/PhoWhisper-small",
+                    device=-1,  # CPU
+                    framework="pt"  # Force PyTorch
                 )
-                logger.info("✅ Faster-Whisper Loaded")
+                logger.info("✅ PhoWhisper Loaded")
             except Exception as e:
-                logger.error(f"Error loading Faster-Whisper: {e}")
-                self.whisper_model = None
+                logger.error(f"❌ Error loading PhoWhisper: {e}")
+                import traceback
+                logger.error(traceback.format_exc())
+                self.phowhisper_model = None
+        else:
+            logger.warning("⚠️ PhoWhisper not available - speech transcription disabled")
+            self.phowhisper_model = None
 
-        # 2. Load AST (Giữ nguyên vì chưa có thay thế nhẹ hơn tốt hơn)
-        if TRANSFORMERS_AVAILABLE:
+        # 3. Load PhoBERT (Vietnamese Toxic Classification)
+        if PHOBERT_AVAILABLE:
             try:
-                model_name = "MIT/ast-finetuned-audioset-10-10-0.4593"
-                self.ast_processor = AutoFeatureExtractor.from_pretrained(model_name)
-                self.ast_model = ASTForAudioClassification.from_pretrained(
-                    model_name
-                ).to(self.device)
-                logger.info("✅ AST Model Loaded")
+                logger.info("⏳ Loading PhoBERT toxic classification model...")
+                self.device = "cuda" if torch.cuda.is_available() else "cpu"
+                
+                # Use a Vietnamese toxic comment classification model
+                # You can replace with your own fine-tuned model
+                model_name = "wonrax/phobert-base-vietnamese-sentiment"
+                
+                self.phobert_tokenizer = AutoTokenizer.from_pretrained(model_name)
+                self.phobert_model = AutoModelForSequenceClassification.from_pretrained(model_name)
+                self.phobert_model.to(self.device)
+                self.phobert_model.eval()
+                
+                logger.info(f"✅ PhoBERT Loaded (Device: {self.device})")
             except Exception as e:
-                logger.error(f"Error loading AST: {e}")
-                self.ast_model = None
+                logger.error(f"❌ Error loading PhoBERT: {e}")
+                import traceback
+                logger.error(traceback.format_exc())
+                self.phobert_tokenizer = None
+                self.phobert_model = None
+        else:
+            logger.warning("⚠️ PhoBERT not available - toxic classification disabled")
+            self.phobert_tokenizer = None
+            self.phobert_model = None
 
     def connect_kafka(self):
         """Connect to Kafka"""
@@ -166,73 +238,151 @@ class AudioConsumer:
             return None
 
     def detect_sound_events(self, audio_array: np.ndarray) -> Dict:
-        """AST Detection"""
-        if not self.ast_model:
+        """YAMNet Sound Event Detection"""
+        if not self.yamnet_model:
             return {"is_harmful": False, "label": None, "score": 0.0}
 
         try:
-            # AST xử lý tốt nhất khoảng 5-10s, nhưng buffer của mình 5s là đẹp
-            inputs = self.ast_processor(
-                audio_array, sampling_rate=self.target_sample_rate, return_tensors="pt"
+            # YAMNet expects audio at 16kHz as a 1D numpy array
+            # Input should be in the range [-1, 1]
+            
+            # Normalize audio if needed
+            max_val = np.max(np.abs(audio_array))
+            if max_val > 1.0:
+                audio_normalized = audio_array / (max_val + 1e-7)
+            else:
+                audio_normalized = audio_array
+
+            # Run YAMNet inference
+            scores, embeddings, spectrogram = self.yamnet_model(
+                tf.constant(audio_normalized, dtype=tf.float32)
             )
-            inputs = {k: v.to(self.device) for k, v in inputs.items()}
 
-            with torch.no_grad():
-                outputs = self.ast_model(**inputs)
-                probs = torch.softmax(outputs.logits, dim=-1)
-                score, idx = torch.max(probs, dim=-1)
-                predicted_label = self.ast_model.config.id2label[idx.item()]
-                score_val = score.item()
+            # Get top prediction
+            top_idx = tf.argmax(scores, axis=-1).numpy()[-1]  # Get last frame's top class
+            top_score = tf.reduce_max(scores, axis=-1).numpy()[-1]
 
-            is_harmful = (
-                score_val > 0.35 and predicted_label in self.harmful_sound_labels
-            )  # Tăng ngưỡng lên chút
+            # Get label name
+            if top_idx < len(self.yamnet_classes):
+                predicted_label = self.yamnet_classes[int(top_idx)]
+            else:
+                predicted_label = f"Unknown_class_{top_idx}"
+
+            # Define harmful sound events
+            harmful_keywords = [
+                "gunshot",
+                "explosion",
+                "screaming",
+                "yelling",
+                "shouting",
+                "crying",
+                "gunfire",
+                "bang",
+                "fighting",
+                "violence",
+                "aggressive",
+                "alarm",
+                "siren",
+                "breaking",
+                "crash",
+                "glass breaking",
+                "impact",
+                "punch",
+                "kick",
+                "weapon",
+            ]
+
+            # Check if detected sound is harmful
+            is_harmful = any(
+                keyword in predicted_label.lower() for keyword in harmful_keywords
+            ) and top_score > 0.35
+
+            # Log YAMNet detection output
+            logger.info(f"🎵 YAMNet detected: {predicted_label} (confidence: {top_score:.2%})")
 
             return {
                 "is_harmful": is_harmful,
                 "label": predicted_label,
-                "score": score_val,
+                "score": float(top_score),
             }
         except Exception as e:
-            # logger.error(f"AST error: {e}") # Tắt log rác nếu cần
+            logger.error(f"YAMNet error: {e}")
             return {"is_harmful": False, "label": None, "score": 0.0}
 
     def transcribe_and_check_toxic(self, audio_buffer: np.ndarray) -> Dict:
-        """Faster-Whisper Transcription + Keyword Check"""
-        if not self.whisper_model:
-            return {"is_toxic": False, "text": "", "keywords": []}
+        """PhoWhisper Transcription + PhoBERT Toxic Classification"""
+        if not self.phowhisper_model:
+            return {"is_toxic": False, "text": "", "keywords": [], "score": 0.0}
 
         try:
-            # Faster-whisper cực nhanh
-            # beam_size=1 để nhanh nhất có thể (greedy search)
-            segments, _ = self.whisper_model.transcribe(
-                audio_buffer,
-                language="vi",
-                beam_size=1,
-                vad_filter=True,  # Tự động lọc khoảng lặng, giúp chính xác hơn
-            )
+            # Step 1: Transcribe audio to Vietnamese text using PhoWhisper
+            # Pipeline expects dict with 'raw' and 'sampling_rate' keys
+            audio_input = {
+                "raw": audio_buffer,
+                "sampling_rate": self.target_sample_rate
+            }
+            result = self.phowhisper_model(audio_input)
+            text = result.get("text", "").strip()
 
-            # Gộp text từ các segments
-            text = " ".join([s.text for s in segments]).strip()
+            # Log PhoWhisper output
+            if text:
+                logger.info(f"📝 PhoWhisper transcribed: {text}")
+            else:
+                logger.info(f"📝 PhoWhisper transcribed: (no speech detected)")
 
             if not text:
-                return {"is_toxic": False, "text": "", "keywords": []}
+                return {"is_toxic": False, "text": "", "keywords": [], "score": 0.0}
 
-            # Check toxic
-            from config import TOXIC_KEYWORDS
+            # Step 2: Classify toxicity using PhoBERT
+            if not self.phobert_model or not self.phobert_tokenizer:
+                # Fallback to keyword matching if PhoBERT not available
+                from config import TOXIC_KEYWORDS
+                toxic_result = check_toxic_content(text, TOXIC_KEYWORDS)
+                return {
+                    "is_toxic": toxic_result["is_toxic"],
+                    "text": text,
+                    "keywords": toxic_result.get("matched_keywords", []),
+                    "score": toxic_result.get("toxic_score", 0),
+                }
 
-            toxic_result = check_toxic_content(text, TOXIC_KEYWORDS)
+            # Use PhoBERT for classification
+            inputs = self.phobert_tokenizer(
+                text,
+                return_tensors="pt",
+                truncation=True,
+                max_length=256,
+                padding=True
+            ).to(self.device)
+
+            with torch.no_grad():
+                outputs = self.phobert_model(**inputs)
+                logits = outputs.logits
+                probs = torch.softmax(logits, dim=-1)
+                
+                # Assuming model outputs [negative, neutral, positive]
+                # or [non-toxic, toxic] - adjust based on your model
+                # For sentiment model: negative sentiment might indicate toxicity
+                negative_score = float(probs[0][0])  # negative class
+                
+                # Consider negative sentiment as potential toxic content
+                is_toxic = negative_score > 0.6  # Adjust threshold as needed
+                toxic_score = negative_score
+
+            # Log PhoBERT classification result
+            logger.info(f"🤖 PhoBERT toxic score: {toxic_score:.2%} (is_toxic: {is_toxic})")
 
             return {
-                "is_toxic": toxic_result["is_toxic"],
+                "is_toxic": is_toxic,
                 "text": text,
-                "keywords": toxic_result.get("matched_keywords", []),
-                "score": toxic_result.get("toxic_score", 0),
+                "keywords": [],  # PhoBERT doesn't return keywords
+                "score": toxic_score,
             }
 
         except Exception as e:
-            logger.error(f"Whisper error: {e}")
-            return {"is_toxic": False, "text": "", "keywords": []}
+            logger.error(f"PhoWhisper/PhoBERT error: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return {"is_toxic": False, "text": "", "keywords": [], "score": 0.0}
 
     def process_message(self, message: Dict):
         """
@@ -241,6 +391,7 @@ class AudioConsumer:
         chunk_id = message.get("chunk_id")
         timestamp = message.get("timestamp")
         b64_data = message.get("data")
+        session_id = message.get("session_id", "unknown")  # Get session ID
 
         if not b64_data:
             return
@@ -265,16 +416,19 @@ class AudioConsumer:
 
         # --- PHÂN TÍCH ---
 
-        # A. Detect Sound (AST) - Dùng toàn bộ buffer (5s) để detect chính xác hơn
+        # A. Detect Sound (YAMNet) - Dùng toàn bộ buffer (5s) để detect chính xác hơn
         sound_event = self.detect_sound_events(self.audio_buffer)
 
-        # B. Transcribe (Whisper) - Dùng toàn bộ buffer (5s) để lấy ngữ cảnh
+        # B. Transcribe (PhoWhisper + PhoBERT) - Dùng toàn bộ buffer (5s) để lấy ngữ cảnh
         speech_result = self.transcribe_and_check_toxic(self.audio_buffer)
+
+        # Log combined results
+        logger.info(f"📊 Chunk {chunk_id} Analysis - Sound: {sound_event['label']} ({sound_event['score']:.2%}) | Text: '{speech_result['text'][:50]}{'...' if len(speech_result['text']) > 50 else ''}' | Toxic: {speech_result['is_toxic']}")
 
         # 3. Alert Logic
         alert_details = ""
 
-        # --- Xử lý AST Alert ---
+        # --- Xử lý Sound Event Alert ---
         if sound_event["is_harmful"]:
             alert_details = (
                 f"Detected: {sound_event['label']} ({sound_event['score']:.1%})"
@@ -282,37 +436,41 @@ class AudioConsumer:
             logger.warning(f"🔊 {alert_details}")
 
             if self.alert_throttler.should_send_alert("audio_scream"):
-                self.db_handler.save_alert(
-                    {
-                        "source": "audio",
-                        "frame_id": chunk_id,
-                        "detection_type": "Audio Event",
-                        "type": "HIGH",
-                        "confidence": sound_event["score"],
-                        "details": alert_details,
-                        "timestamp": timestamp,
-                    }
-                )
+                alert_record = {
+                    "source": "audio",
+                    "frame_id": chunk_id,
+                    "detection_type": "violent_audio",
+                    "type": "HIGH",
+                    "confidence": sound_event["score"],
+                    "details": alert_details,
+                    "timestamp": timestamp,
+                    "session_id": session_id,
+                }
+                self.db_handler.save_alert(alert_record)
+                # Update video session
+                self.db_handler.update_video_session(session_id, alert_record)
 
-        # --- Xử lý Toxic Alert ---
+        # --- Xử lý Toxic Speech Alert ---
         if speech_result["is_toxic"]:
             alert_details = (
-                f"Toxic: {speech_result['keywords']} | '{speech_result['text']}'"
+                f"Toxic score: {speech_result['score']:.2%} | '{speech_result['text']}'"
             )
             logger.warning(f"🤬 {alert_details}")
 
             if self.alert_throttler.should_send_alert("audio_toxic"):
-                self.db_handler.save_alert(
-                    {
-                        "source": "audio",
-                        "frame_id": chunk_id,
-                        "detection_type": "Toxic Speech",
-                        "type": "MEDIUM",
-                        "confidence": 1.0,
-                        "details": alert_details,
-                        "timestamp": timestamp,
-                    }
-                )
+                alert_record = {
+                    "source": "audio",
+                    "frame_id": chunk_id,
+                    "detection_type": "toxic_speech",
+                    "type": "MEDIUM",
+                    "confidence": speech_result["score"],
+                    "details": alert_details,
+                    "timestamp": timestamp,
+                    "session_id": session_id,
+                }
+                self.db_handler.save_alert(alert_record)
+                # Update video session
+                self.db_handler.update_video_session(session_id, alert_record)
 
         # 4. Save Record
         # Lưu text đầy đủ để hiển thị lên dashboard
@@ -324,7 +482,9 @@ class AudioConsumer:
                 "sound_label": sound_event["label"],
                 "sound_confidence": sound_event["score"],
                 "is_toxic": speech_result["is_toxic"],
+                "toxic_score": speech_result["score"],
                 "is_screaming": sound_event["is_harmful"],
+                "session_id": session_id,
             }
         )
 
