@@ -9,7 +9,7 @@ from pathlib import Path
 BASE_DIR = Path(__file__).resolve().parent.parent
 MODELS_DIR = BASE_DIR / "models"
 DATA_DIR = BASE_DIR / "data"
-SCAN_INTERVAL = 5  # seconds
+SCAN_INTERVAL = 10  # seconds
 SUPPORTED_EXTS = {".mp4", ".avi", ".mkv"}
 
 # Kafka Configuration

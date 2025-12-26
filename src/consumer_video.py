@@ -95,7 +95,8 @@ class VideoConsumer:
         self.db_handler = MongoDBHandler()
         self.alert_throttler = AlertThrottler(
             cooldown_seconds=2
-        )  # Giảm cooldown để test dễ hơn
+        )
+        self.current_session_id = None
         self.frame_count = 0
 
         self.yolo_model = None
@@ -393,13 +394,19 @@ class VideoConsumer:
             timestamp = message.get("timestamp", time.time())
             frame_data = message.get("data", "")
             session_id = message.get("session_id", "unknown")  # Get session ID
-
+            
             if not frame_data:
                 return
 
             frame = decode_base64_to_image(frame_data)
             if frame is None:
                 return
+
+            # ✅ Reset frame_count nếu là session mới
+            if session_id != self.current_session_id:
+                self.current_session_id = session_id
+                self.frame_count = 0
+                logger.info(f"🔄 New session detected: {session_id}, reset frame_count")
 
             self.frame_count += 1
 
@@ -423,7 +430,7 @@ class VideoConsumer:
                 "timestamp": timestamp,
                 "detections": result["harmful_detections"],
                 "text_detection": text_result,
-                "is_harmful": True,
+                "is_harmful": result["is_harmful"],
                 "data": frame_data,
                 "session_id": session_id,
                 "detection_type": ", ".join(detection_types) if len(detection_types) > 1 else detection_types[0] if detection_types else "violent_video",

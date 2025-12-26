@@ -71,11 +71,17 @@ class MongoDBHandler:
             logger.error(f"Failed to connect to MongoDB: {e}")
             raise
 
-    def video_exists(self, video_path: str) -> bool:
-        return (
-            self.db[MONGO_COLLECTION_VIDEO_SUMMARY]
-            .find_one({"video_info.video_path": video_path}) is not None
+    def find_all_video_path(self) -> list[str]:
+        cursor = self.db[MONGO_COLLECTION_VIDEO_SUMMARY].find(
+            {},
+            {"_id": 0, "video_info.video_path": 1}
         )
+
+        return [
+            doc["video_info"]["video_path"]
+            for doc in cursor
+            if "video_info" in doc and "video_path" in doc["video_info"]
+        ]
 
     def save_detection(self, detection_data: Dict[str, Any]):
         """Save detection result to database"""
@@ -158,7 +164,6 @@ class MongoDBHandler:
                     "toxic_speech": 0,
                     "toxic_text": 0
                 },
-                "detections": [],
                 "summary": None,
             }
             result = self.db[MONGO_COLLECTION_VIDEO_SUMMARY].insert_one(session_data)
@@ -177,31 +182,32 @@ class MongoDBHandler:
             detection_type = detection_data.get("detection_type", "unknown")
             
             # Increment appropriate counter
-            update_query = {"$push": {"detections": detection_data}}
+            update_query = {}
+            logger.info("detection_type.lower(): " + detection_type.lower())
             
-            if "violence" in detection_type.lower() and "video" in detection_type.lower():
+            if "violent_video" in detection_type.lower():
                 update_query["$inc"] = {"detection_counts.violent_video": 1}
                 update_query["$addToSet"] = {"toxic_categories": "violent_video"}
                 update_query["$set"] = {"is_toxic": True}
-            elif "toxic_text" in detection_type.lower() or "text_on_screen" in detection_type.lower():
+            elif "toxic_text_on_screen" in detection_type.lower():
                 update_query["$inc"] = {"detection_counts.toxic_text": 1}
                 update_query["$addToSet"] = {"toxic_categories": "toxic_text"}
                 update_query["$set"] = {"is_toxic": True}
-            elif "sound" in detection_type.lower() or "audio" in detection_type.lower():
+            elif "violent_audio" in detection_type.lower():
                 update_query["$inc"] = {"detection_counts.violent_audio": 1}
                 update_query["$addToSet"] = {"toxic_categories": "violent_audio"}
                 update_query["$set"] = {"is_toxic": True}
-            elif "speech" in detection_type.lower() or "toxic" in detection_type.lower():
+            elif "toxic_speech" in detection_type.lower():
                 update_query["$inc"] = {"detection_counts.toxic_speech": 1}
                 update_query["$addToSet"] = {"toxic_categories": "toxic_speech"}
                 update_query["$set"] = {"is_toxic": True}
             
             logger.info(f"Updated video session {session_id} with toxic speech detection.")
-            # logger.info(f"Update query: {update_query}")
-            self.db[MONGO_COLLECTION_VIDEO_SUMMARY].update_one(
-                {"session_id": session_id},
-                update_query
-            )
+            if update_query:
+                self.db[MONGO_COLLECTION_VIDEO_SUMMARY].update_one(
+                    {"session_id": session_id},
+                    update_query
+                )
         except Exception as e:
             logger.error(f"Failed to update video session: {e}")
 

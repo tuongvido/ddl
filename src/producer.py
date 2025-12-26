@@ -304,6 +304,7 @@ def main():
     while True:
         logger.info(f"📂 Watching folder: {DATA_DIR.resolve()}")
         try:
+            processed_videos = db_handler.find_all_video_path();
             video_files = sorted(
                 [
                     f for f in DATA_DIR.iterdir()
@@ -315,12 +316,7 @@ def main():
                 video_path_str = str(video_path.resolve())
 
                 if video_path_str in processed_videos:
-                    continue
-
-                # 👉 Skip nếu video đã từng xử lý
-                if db_handler.video_exists(video_path_str):
                     logger.info(f"⏭ Skip processed video: {video_path.name}")
-                    processed_videos.add(video_path_str)
                     continue
 
                 logger.info(f"🎬 New video detected: {video_path.name}")
@@ -332,7 +328,6 @@ def main():
                     )
                     producer.run()
 
-                    processed_videos.add(video_path.name)
                     logger.info(f"✅ Finished processing: {video_path.name}")
 
                 except Exception as e:

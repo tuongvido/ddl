@@ -196,7 +196,7 @@ def main():
                     "HIGH Alerts", len([a for a in alerts if a.get("type") == "HIGH"])
                 )
 
-                if alerts:
+                if is_toxic and alerts:
                     df = pd.DataFrame(alerts)
                     fig = px.scatter(
                         df,
